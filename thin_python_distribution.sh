@@ -12,7 +12,7 @@ shift || true
 calc_size() {
     local dir="$1"
     if [ -d "$dir" ]; then
-        /usr/bin/du -sh "$dir" | cut -f1
+        /usr/bin/du -shk "$dir" | cut -f1 | /usr/bin/awk '{printf "%.2f MB\n", $1/1024}'
     else
         echo "0B"
     fi

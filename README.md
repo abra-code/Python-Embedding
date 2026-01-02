@@ -2,7 +2,7 @@
 Build a minimal, relocatable deployment-only Python runtime for embedding in macOS apps<br>
 
 Main script: `build-embedded-python.sh`<br>
-  - builds universal binaries from the latest versions of Python with latest version of OpenSSL when invoked without any arguments:
+  - builds universal binaries from the latest version of Python with latest version of OpenSSL when invoked without any arguments:
     `./build-embedded-python.sh`
   - you may specify --arch=arm64 for single-architecture binary for Apple Silicon Macs only
   - you may specify a desired Python version with --version=3.x.x
