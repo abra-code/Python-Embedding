@@ -371,6 +371,7 @@ configure_python() {
         --prefix="$INSTALL_DIR"
         --with-openssl="$OPENSSL_INSTALL"
         --with-openssl-rpath=auto
+        --disable-tkinter
     )
 
     flags+=(MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET})
