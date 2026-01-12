@@ -11,6 +11,7 @@ RESET="\033[0m"
 VERSION="auto"
 ARCH="universal"
 OPENSSL_VERSION="auto"
+FINAL_DIR=""
 
 show_help() {
     cat <<EOF
@@ -22,6 +23,7 @@ Options:
                       Note: cross-compilation, e.g. building x86_64 on Apple Silicon Macs
                             is not supported by Python build system. Build universal instead
   --openssl-version=VERSION   OpenSSL version (default: auto-detect latest stable)
+  --output=path/to/final/dir  Optional path to final directory to place built products
   --help              Show this help message
 
 Example:
@@ -40,6 +42,9 @@ while [[ $# -gt 0 ]]; do
         --arch) shift; ARCH="$1" ;;
         --openssl-version=*) OPENSSL_VERSION="${1#*=}" ;;
         --openssl-version) shift; OPENSSL_VERSION="$1" ;;
+        --output=*) FINAL_DIR="${1#*=}" ;;
+        --output) shift; FINAL_DIR="$1" ;;
+
         *) echo "Unknown option: $1"; show_help ;;
     esac
     shift
@@ -143,7 +148,9 @@ prepare() {
     OPENSSL_BUILD="${BUILD_FLAVOR_DIR}/openssl-build"
     OPENSSL_INSTALL="${BUILD_FLAVOR_DIR}/openssl-install"
     INSTALL_DIR="${BUILD_FLAVOR_DIR}/install"
-    FINAL_DIR="${START_DIR}/Python-${VERSION}-${ARCH}"
+    if [ -z "$FINAL_DIR" ]; then
+        FINAL_DIR="${START_DIR}/Python-${VERSION}-${ARCH}"
+    fi
 
     /bin/mkdir -pv "${PYTHONPYCACHEPREFIX}"
     /bin/mkdir -pv "${DOWNLOAD_DIR}"
@@ -359,7 +366,7 @@ configure_python() {
 
     local -a flags=(
         --enable-shared
-# TEMP DISABLE        --enable-optimizations
+        --enable-optimizations
         --with-lto
         --prefix="$INSTALL_DIR"
         --with-openssl="$OPENSSL_INSTALL"
