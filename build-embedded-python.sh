@@ -403,6 +403,41 @@ build_and_install() {
     /usr/bin/make install
 }
 
+fix_helper_shebangs() {
+    echo "Fixing absolute shebangs in helper scripts..."
+
+    local bin_dir="$INSTALL_DIR/bin"
+    local python_shebang="#!/usr/bin/env python3"
+
+    for script in "$bin_dir"/*; do
+        # Skip non-regular files and symlinks
+        [ -f "$script" ] || continue
+        [ -L "$script" ] && continue
+
+        local first_line
+        first_line=$(head -n 1 "$script" 2>/dev/null || echo "")
+        echo "$first_line" | /usr/bin/grep -q '^#!.*python' || continue
+
+        echo "  Changing shebang in $(basename "$script")"
+        /usr/bin/sed -i '' "1s|^#!.*|${python_shebang}|" "$script"
+    done
+}
+
+fix_pkgconfig() {
+    echo "Fixing absolute paths in pkg-config files..."
+    local pc_dir="$INSTALL_DIR/lib/pkgconfig"
+
+    for pc in "$pc_dir"/*.pc; do
+        [ -f "$pc" ] || continue
+        [ -L "$pc" ] && continue  # skip symlinks
+
+        echo "  Updating $pc"
+        # Replace absolute prefix with ${prefix} (already is) and ensure no hard absolute
+        /usr/bin/sed -i '' "s|^prefix=.*|prefix=\${pcfiledir}/../..|" "$pc"  # relative from .pc location
+        /usr/bin/sed -i '' "s|$INSTALL_DIR|\${prefix}|g" "$pc"
+    done
+}
+
 strip_debug_symbols() {
     echo
     echo "==== Stripping debug symbols ===="
@@ -504,8 +539,8 @@ deployment_cleanup() {
 
     cd "$INSTALL_DIR"
 
-    echo "  Removing include/ and share/man/"
-    /bin/rm -rfv include share/man
+    echo "  Removing share/man/"
+    /bin/rm -rfv share/man
 
     echo "  Removing config directory (static lib + build files)"
     /bin/rm -rfv lib/python${MAJOR_MINOR}/config-3.14-darwin
@@ -619,6 +654,8 @@ main() {
     build_openssl
     configure_python
     build_and_install
+    fix_helper_shebangs
+    fix_pkgconfig
     make_relocatable
     copy_and_relocate_openssl_dylibs
     relocate_ssl_extensions

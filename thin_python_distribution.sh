@@ -44,6 +44,7 @@ Common optional removals (verify your app/scripts do not need them):
   pip             - Package manager (~20-30MB with deps)
   setuptools      - Packaging tools
   certifi         - CA certificate bundle (breaks HTTPS verification if removed)
+  include         - "include" headers for building some modules (not needed in sealed Python package)
 
   codecs_east_asian - East-Asian text encodings (_codecs_jp/cn/hk/kr/tw.so; ~800KB total)
 
@@ -173,6 +174,13 @@ remove_component() {
             /bin/rm -f "$so_file"
             removed=true
         done <<< "$so_files"
+    fi
+
+    # Handle include headers dir
+    if [[ "$comp" == "include" ]]; then
+        echo "  Removing $PYTHON_DIR/include"
+        /bin/rm -rf "$PYTHON_DIR/include"
+        removed=true
     fi
 
     # Handle site-packages special cases
