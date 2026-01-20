@@ -45,6 +45,7 @@ Common optional removals (verify your app/scripts do not need them):
   setuptools      - Packaging tools
   certifi         - CA certificate bundle (breaks HTTPS verification if removed)
   include         - "include" headers for building some modules (not needed in sealed Python package)
+  pyc             - all __pycache__ dirs + *.pyc / *.pyo files (useful after pip install)
 
   codecs_east_asian - East-Asian text encodings (_codecs_jp/cn/hk/kr/tw.so; ~800KB total)
 
@@ -54,8 +55,8 @@ Note: Removing ssl/hashlib breaks HTTPS and modern crypto.
       Removing certifi breaks SSL certificate verification.
 
 Example:
-  $0 --arch=arm64 ./Python-3.14.2-universal ssl hashlib sqlite3 pip
-  $0 ./Python-3.14.2-arm64 xml curses decimal
+  $0 --arch=arm64 ./Python-3.14.2-universal ssl hashlib sqlite3 pip pyc
+  $0 ./Python-3.14.2-arm64 xml curses decimal pyc
 
 HELP
     exit 1
@@ -147,7 +148,53 @@ remove_component() {
     local site_pkgs="$4"
     
     echo "Processing component: $comp"
+
+    # Remove all pyc precompiled objects
+    if [[ "$comp" == "pyc" ]]; then
+        echo "  Removing all __pycache__ directories and *.pyc/*.pyo files"
+        /usr/bin/find "$PYTHON_DIR" -type d -name "__pycache__" -exec /bin/rm -rf {} +
+        /usr/bin/find "$PYTHON_DIR" -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
+        echo "  Bytecode cleanup complete."
+        echo
+        return
+    fi
+
+	# Remove include headers dir
+    if [[ "$comp" == "include" ]]; then
+        echo "  Removing $PYTHON_DIR/include"
+        /bin/rm -rf "$PYTHON_DIR/include"
+        echo
+        return
+    fi
+
     local removed=false
+
+	# Remove East Asian codecs
+    if [[ "$comp" == "codecs_east_asian" ]]; then
+        local codec
+        for codec in jp cn hk kr tw; do
+            local codec_files
+            codec_files=$(/usr/bin/find "$dynload" -maxdepth 1 -name "_codecs_${codec}*.so" 2>/dev/null || echo "")
+            
+            if [ -n "$codec_files" ]; then
+                local codec_file
+                while IFS= read -r codec_file; do
+                    [ -z "$codec_file" ] && continue
+                    echo "  Removing East-Asian codec extension: $codec_file"
+                    /bin/rm -f "$codec_file"
+                    removed=true
+                done <<< "$codec_files"
+            fi
+        done
+        
+        if ! $removed; then
+            echo "  No East-Asian codec extensions found."
+        fi
+        echo
+        return
+    fi
+
+    # General component removal
 
     # Remove directory
     if [ -d "$lib_dir/$comp" ]; then
@@ -176,13 +223,6 @@ remove_component() {
         done <<< "$so_files"
     fi
 
-    # Handle include headers dir
-    if [[ "$comp" == "include" ]]; then
-        echo "  Removing $PYTHON_DIR/include"
-        /bin/rm -rf "$PYTHON_DIR/include"
-        removed=true
-    fi
-
     # Handle site-packages special cases
     if [[ "$comp" == "pip" || "$comp" == "setuptools" || "$comp" == "certifi" ]]; then
         local site_items=$(/usr/bin/find "$site_pkgs" -maxdepth 1 -name "${comp}*" 2>/dev/null || echo "")
@@ -205,25 +245,6 @@ remove_component() {
             /bin/rm -f "$PYTHON_DIR/lib/libssl.dylib"
             removed=true
         fi
-    fi
-
-    # Handle East Asian codecs
-    if [ "$comp" = "codecs_east_asian" ]; then
-        local codec
-        for codec in jp cn hk kr tw; do
-            local codec_files
-            codec_files=$(/usr/bin/find "$dynload" -maxdepth 1 -name "_codecs_${codec}*.so" 2>/dev/null || echo "")
-            
-            if [ -n "$codec_files" ]; then
-                local codec_file
-                while IFS= read -r codec_file; do
-                    [ -z "$codec_file" ] && continue
-                    echo "  Removing East-Asian codec extension: $codec_file"
-                    /bin/rm -f "$codec_file"
-                    removed=true
-                done <<< "$codec_files"
-            fi
-        done
     fi
 
     if ! $removed; then
