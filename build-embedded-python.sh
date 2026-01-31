@@ -50,6 +50,12 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+# Normalize FINAL_DIR to absolute path right after parsing
+if [ -n "$FINAL_DIR" ]; then
+    FINAL_DIR="$(cd "$(dirname -- "$FINAL_DIR")" 2>/dev/null && pwd)/$(basename -- "$FINAL_DIR")"
+    FINAL_DIR="${FINAL_DIR%/}"   # remove trailing slash if any
+fi
+
 MACOSX_DEPLOYMENT_TARGET="11.0"
 
 SCRIPT_DIR="$(cd "$(/usr/bin/dirname "$0")" >/dev/null 2>&1 && pwd)"  # absolute path to script dir
@@ -528,8 +534,28 @@ install_additional_modules() {
     echo "==== Installing certifi for SSL certificate verification ===="
     echo
 
-    cd "$INSTALL_DIR/bin/"
-    ./python${MAJOR_MINOR} -m pip install --verbose certifi --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
+    "${INSTALL_DIR}/bin/python${MAJOR_MINOR}" -m pip install --verbose certifi --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
+
+	# For universal builds only: install universalPip to enable universal2 module installs later
+    if [ "$ARCH" = "universal" ]; then
+        echo ""
+        echo "  universal build detected; installing universalPip (uPip) for universal2 pip installs"
+        "${INSTALL_DIR}/bin/python${MAJOR_MINOR}" -m pip install --verbose universalPip --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
+
+        # Patch the broken uPip script (wrong import: uPip.cli instead of universalPip.cli)
+        local upip_script="${INSTALL_DIR}/bin/uPip"
+        if [ -f "$upip_script" ]; then
+            echo "  Patching uPip script (fixing import from uPip.cli to universalPip.cli)"
+            /usr/bin/sed -i '' 's/from uPip.cli/from universalPip.cli/' "$upip_script"
+            # Optional: make it executable just in case
+            /bin/chmod +x "$upip_script"
+            echo "  Patch applied."
+        else
+            echo "  Warning: uPip script not found after install — skipping patch"
+        fi
+    else
+        echo "  Single-arch build, skipping universalPip installation"
+    fi
 }
 
 deployment_cleanup() {
@@ -641,7 +667,7 @@ print_summary() {
     echo "Size: $(calc_size "$FINAL_DIR")"
     echo "Invoke with: $FINAL_DIR/bin/python${MAJOR_MINOR}"
     echo "Next steps:"
-    echo "  1. Install packages: $FINAL_DIR/bin/python${MAJOR_MINOR} -m pip install ..."
+    echo "  1. Install modules: ./install_modules.sh --python-dir \"$FINAL_DIR/bin/python${MAJOR_MINOR}\" module"
     echo "  2. Thin further if needed: ./thin_python_distribution.sh \"$FINAL_DIR\" ..."
     echo "  3. Bundle and test in your app"
     echo
@@ -654,12 +680,12 @@ main() {
     build_openssl
     configure_python
     build_and_install
-    fix_helper_shebangs
     fix_pkgconfig
     make_relocatable
     copy_and_relocate_openssl_dylibs
     relocate_ssl_extensions
     install_additional_modules
+    fix_helper_shebangs
     strip_debug_symbols
     deployment_cleanup
     finalize

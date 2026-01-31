@@ -41,7 +41,7 @@ Common optional removals (verify your app/scripts do not need them):
   multiprocessing - Parallel execution (~408KB multiprocessing/ dir)
   unittest        - Testing framework (~284KB unittest/ dir)
   xmlrpc          - XML-RPC client/server (deprecated; ~88KB xmlrpc/ dir)
-  pip             - Package manager (~20-30MB with deps)
+  pip             - Package manager (~20-30MB with deps) — also removes universalPip/uPip if installed
   setuptools      - Packaging tools
   certifi         - CA certificate bundle (breaks HTTPS verification if removed)
   include         - "include" headers for building some modules (not needed in sealed Python package)
@@ -235,6 +235,20 @@ remove_component() {
                 /bin/rm -rf "$item"
                 removed=true
             done <<< "$site_items"
+        fi
+		
+		# Special: if removing pip, also remove universalPip (installed conditionally in build)
+        if [[ "$comp" == "pip" ]]; then
+            local upip_items=$(/usr/bin/find "$site_pkgs" -maxdepth 1 -name "universalPip*" -o -name "uPip*" 2>/dev/null || echo "")
+            if [ -n "$upip_items" ]; then
+                local item
+                while IFS= read -r item; do
+                    [ -z "$item" ] && continue
+                    echo "  Removing universalPip/uPip: $item (removed with pip)"
+                    /bin/rm -rf "$item"
+                    removed=true
+                done <<< "$upip_items"
+            fi
         fi
     fi
 
