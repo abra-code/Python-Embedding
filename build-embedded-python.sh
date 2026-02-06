@@ -590,6 +590,9 @@ deployment_cleanup() {
                 lib/python${MAJOR_MINOR}/lib-dynload/_testimportmultiple*.so \
                 lib/python${MAJOR_MINOR}/lib-dynload/_testclinic_limited*.so
 
+    echo "  Removing all tests directories"
+    /usr/bin/find lib/python${MAJOR_MINOR} -type d -name "tests" -exec /bin/rm -rfv {} +
+
     echo "  Removing precompiled bytecode"
     /usr/bin/find lib/python${MAJOR_MINOR} -type d -name "__pycache__" -exec /bin/rm -rfv {} +
     /usr/bin/find lib/python${MAJOR_MINOR} -name "*.py[co]" -exec /bin/rm -v {} \;
