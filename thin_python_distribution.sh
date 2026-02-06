@@ -4,7 +4,7 @@
 # Usage: ./thin_python_distribution.sh [--arch arm64|x86_64] /path/to/Python [component1 component2 ...]
 #   Without arguments: prints this help.
 
-set -euo pipefail
+set -uo pipefail
 
 ARCH=""
 PYTHON_DIR=""
@@ -104,7 +104,7 @@ thin_to_single_arch() {
     echo "Thinning all universal Mach-O files to $arch ..."
     
     # Collect all candidate binary files
-    local executable_files=$(/usr/bin/find "$PYTHON_DIR" -type f \( -name '*.dylib' -o -name '*.so' -o -perm +111 \))
+    local executable_files=$(/usr/bin/find "$PYTHON_DIR" -type f \( -name '*.dylib' -o -name '*.so' -o -perm -u+x \))
 
     local thinned=0
     local file
@@ -112,24 +112,21 @@ thin_to_single_arch() {
     # Process each candidate file
     while IFS= read -r file; do
         [ -z "$file" ] && continue
-        
-        # Check if file is a universal Mach-O binary
+
         local file_info=$(/usr/bin/file "$file" 2>/dev/null)
-        
+
         local is_universal=$(echo "$file_info" | /usr/bin/grep -c "Mach-O.*universal")
-        
+
         if [ "$is_universal" -gt 0 ]; then
             echo "  Thinning: $file"
             local tmp="$file.thin.tmp"
-            
-            set +e
+
             /usr/bin/lipo -thin "$arch" "$file" -output "$tmp" 2>/dev/null
             local lipo_result=$?
-            set -e
             
             if [ $lipo_result -eq 0 ]; then
                 /bin/mv "$tmp" "$file"
-                ((thinned++))
+                thinned=$((thinned + 1))
             else
                 echo "    Warning: lipo -thin $arch failed on $file (arch possibly missing)"
                 /bin/rm -f "$tmp"

@@ -2,11 +2,11 @@
 # build-embedded-python.sh
 # Builds a minimal, relocatable deployment-only Python for macOS embedding.
 
-set -euo pipefail
+set -uo pipefail
 
-GREEN="\033[92m"
-RED="\033[91m"
-RESET="\033[0m"
+RED=$(printf '\033[91m')
+GREEN=$(printf '\033[92m')
+RESET=$(printf '\033[0m')
 
 VERSION="auto"
 ARCH="universal"
@@ -368,7 +368,7 @@ configure_python() {
     
     # Clean any previous build artifacts that might have wrong architecture
     echo "  Cleaning previous build artifacts..."
-    /usr/bin/make distclean 2>/dev/null || true
+    /usr/bin/make distclean 2>/dev/null
 
     local -a flags=(
         --enable-shared
@@ -537,10 +537,17 @@ install_additional_modules() {
     "${INSTALL_DIR}/bin/python${MAJOR_MINOR}" -m pip install --verbose certifi --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
 
 	# For universal builds only: install universalPip to enable universal2 module installs later
-    if [ "$ARCH" = "universal" ]; then
-        echo ""
-        echo "  universal build detected; installing universalPip (uPip) for universal2 pip installs"
-        "${INSTALL_DIR}/bin/python${MAJOR_MINOR}" -m pip install --verbose universalPip --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
+     if [ "$ARCH" = "universal" ]; then
+         echo ""
+         echo "  universal build detected; installing universalPip (uPip) for universal2 pip installs"
+
+         # Force regex to build universal2 before uPip (uPip depends on regex)
+         echo "  Installing regex as universal2 first..."
+         export ARCHFLAGS="-arch x86_64 -arch arm64"
+         "${INSTALL_DIR}/bin/python${MAJOR_MINOR}" -m pip install --verbose --no-binary :all: --no-deps regex --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
+         unset ARCHFLAGS
+
+         "${INSTALL_DIR}/bin/python${MAJOR_MINOR}" -m pip install --verbose universalPip --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
 
         # Patch the broken uPip script (wrong import: uPip.cli instead of universalPip.cli)
         local upip_script="${INSTALL_DIR}/bin/uPip"
@@ -598,6 +605,62 @@ deployment_cleanup() {
     /usr/bin/find lib/python${MAJOR_MINOR} -name "*.py[co]" -exec /bin/rm -v {} \;
 }
 
+verify_universal_binaries() {
+    local target_dir="$FINAL_DIR"
+
+    if [ "$ARCH" != "universal" ]; then
+        echo
+        echo "  Skipping universal binary verification for single-architecture build"
+        echo
+        return 0
+    fi
+
+    echo
+    echo "==== Verifying all binaries are universal (arm64 + x86_64) ===="
+    echo
+
+    local failed=0
+    local total=0
+    local binary file_info
+    local temp_list="/tmp/verify_binaries_$$"
+
+    local executable_files=$(/usr/bin/find "$target_dir" -type f \( -name '*.dylib' -o -name '*.so' -o -perm -u+x \))
+
+    while IFS= read -r binary; do
+        [ -z "$binary" ] && continue
+        total=$((total + 1))
+
+        file_info=$(/usr/bin/file "$binary" 2>/dev/null)
+
+        is_mach_o=$(echo "$file_info" | /usr/bin/grep -c "Mach-O")
+        if [ "$is_mach_o" -eq 0 ]; then
+            continue
+        fi
+
+        is_universal=$(echo "$file_info" | /usr/bin/grep -c "Mach-O.*universal")
+        if [ "$is_universal" -eq 0 ]; then
+            echo "  ${RED}FAIL${RESET}: $binary - not universal"
+            failed=$((failed + 1))
+            continue
+        fi
+
+        has_arm64=$(echo "$file_info" | /usr/bin/grep -c "arm64")
+        has_x86_64=$(echo "$file_info" | /usr/bin/grep -c "x86_64")
+        if [ "$has_arm64" -eq 0 ] || [ "$has_x86_64" -eq 0 ]; then
+            echo "  ${RED}FAIL${RESET}: $binary - missing architectures"
+            failed=$((failed + 1))
+        fi
+    done <<< "$executable_files"
+
+    echo
+    if [ $failed -gt 0 ]; then
+        echo "  ${RED}Verification FAILED: $failed universal binary issues found${RESET}"
+        exit 1
+    else
+        echo "  ${GREEN}All Mach-O binaries verified as universal (arm64 + x86_64)${RESET}"
+    fi
+}
+
 calc_size() {
     local dir="$1"
     if [ -d "$dir" ]; then
@@ -641,23 +704,19 @@ run_tests() {
     fi
 
     echo "  Executing: $FINAL_DIR/bin/python${MAJOR_MINOR} $test_script"
-    set +e
     "$FINAL_DIR/bin/python${MAJOR_MINOR}" "$test_script"
-    set -e
-    
+
     if [ "$ARCH" = "universal" ]; then
         local build_arch
         build_arch=$(/usr/bin/uname -m)
-        
+
         if [ "$build_arch" = "arm64" ]; then
-            set +e
             local is_rosetta_available=$(/usr/bin/arch -x86_64 /usr/bin/uname -m)
             if [ "$is_rosetta_available" = "x86_64" ]; then
                 echo "  Executing Intel code under Rosetta to verify universal binary:"
                 echo "  arch --x86_64 $FINAL_DIR/bin/python${MAJOR_MINOR} $test_script"
                 /usr/bin/arch --x86_64 "$FINAL_DIR/bin/python${MAJOR_MINOR}" "$test_script"
             fi
-            set -e
         fi
     fi
 }
@@ -693,6 +752,7 @@ main() {
     deployment_cleanup
     finalize
     rename_build_artifacts
+    verify_universal_binaries
     run_tests
     print_summary
 }

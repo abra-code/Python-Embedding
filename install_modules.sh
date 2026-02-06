@@ -2,11 +2,11 @@
 # install_modules.sh
 # Installs additional modules in a relocatable Python distribution for macOS.
 
-set -euo pipefail
+set -uo pipefail
 
-GREEN="\033[92m"
-RED="\033[91m"
-RESET="\033[0m"
+RED=$(printf '\033[91m')
+GREEN=$(printf '\033[92m')
+RESET=$(printf '\033[0m')
 
 PYTHON_DIR=""
 MODULES=()
@@ -60,6 +60,26 @@ if [ -z "$MAJOR_MINOR" ]; then
     exit 1
 fi
 
+is_python_universal() {
+    local main_binary="${PYTHON_DIR}/lib/libpython${MAJOR_MINOR}.dylib"
+    if [ ! -f "$main_binary" ]; then
+        main_binary="${PYTHON_DIR}/bin/python${MAJOR_MINOR}"
+    fi
+
+    if [ ! -f "$main_binary" ]; then
+        return 1
+    fi
+
+    local main_info=$(/usr/bin/lipo -info "$main_binary" 2>&1)
+    if echo "$main_info" | /usr/bin/grep -q "Architectures in the fat file"; then
+        return 0
+    fi
+    return 1
+}
+
+is_python_universal
+IS_UNIVERSAL=$?
+
 install_modules() {
     echo
     echo "==== Installing modules: ${MODULES[*]} ===="
@@ -67,22 +87,36 @@ install_modules() {
 
     local upip_bin="${PYTHON_DIR}/bin/uPip"
 
-    if [ -x "$upip_bin" ]; then
+    if [ -x "$upip_bin" ] && [ $IS_UNIVERSAL -eq 0 ]; then
         echo "  uPip found — installing one module at a time (no --trusted-host support)"
 
         local mod
         for mod in "${MODULES[@]}"; do
             echo "    Installing $mod via uPip"
-            # Explicit interpreter + no trusted-host (uPip doesn't accept them)
             "${PYTHON_BIN}" "$upip_bin" --install "$mod"
+            local upip_result=$?
+            if [ $upip_result -ne 0 ]; then
+                echo "      uPip failed (exit $upip_result) — falling back to pip with ARCHFLAGS=\"-arch x86_64 -arch arm64\""
+                export ARCHFLAGS="-arch x86_64 -arch arm64"
+                "${PYTHON_BIN}" -m pip install --no-binary :all: --force-reinstall "$mod" \
+                    --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
+                unset ARCHFLAGS
+            fi
         done
     else
-        echo "  uPip not found, using regular pip"
-        "${PYTHON_BIN}" -m pip install --verbose \
-            --trusted-host pypi.org \
-            --trusted-host pypi.python.org \
-            --trusted-host files.pythonhosted.org \
-            "${MODULES[@]}"
+        
+        if [ $IS_UNIVERSAL -eq 0 ]; then
+            echo "  uPip not found — using regular pip"
+            export ARCHFLAGS="-arch x86_64 -arch arm64"
+            "${PYTHON_BIN}" -m pip install --no-binary :all: --force-reinstall \
+                --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org \
+                "${MODULES[@]}"
+            unset ARCHFLAGS
+        else
+            "${PYTHON_BIN}" -m pip install --verbose \
+                --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org \
+                "${MODULES[@]}"
+        fi
     fi
 }
 
@@ -138,7 +172,7 @@ make_relocatable() {
         local rel_path="${file#$PYTHON_DIR/}"
         local file_name="${file##*/}"
 
-        /usr/bin/install_name_tool -id "@executable_path/../$rel_path" "$file" 2>/dev/null || true
+        /usr/bin/install_name_tool -id "@executable_path/../$rel_path" "$file" 2>/dev/null
 
         local dependencies=$(/usr/bin/otool -L "$file" | /usr/bin/awk '/^[ \t]+[\/@]/ {print $1}')
 
@@ -171,17 +205,74 @@ strip_debug_symbols() {
     /usr/bin/find "$PYTHON_DIR" -type f \( -name "*.dylib" -o -name "*.so" \) -exec echo "  Stripping {}" \; -exec /usr/bin/strip -x {} \;
 }
 
+verify_universal_binaries() {
+    local target_dir="$PYTHON_DIR"
+
+    if [ $IS_UNIVERSAL -ne 0 ]; then
+        echo
+        echo "  Skipping universal verification — Python is not universal"
+        echo
+        return 0
+    fi
+
+    echo
+    echo "==== Verifying all binaries are universal (arm64 + x86_64) ===="
+    echo
+
+    local failed=0
+    local total=0
+    local binary file_info
+    local temp_list="/tmp/verify_binaries_$$"
+
+    local executable_files=$(/usr/bin/find "$target_dir" -type f \( -name '*.dylib' -o -name '*.so' -o -perm -u+x \))
+
+    while IFS= read -r binary; do
+        [ -z "$binary" ] && continue
+        total=$((total + 1))
+
+        file_info=$(/usr/bin/file "$binary" 2>/dev/null)
+
+        is_mach_o=$(echo "$file_info" | /usr/bin/grep -c "Mach-O")
+        if [ "$is_mach_o" -eq 0 ]; then
+            continue
+        fi
+
+        is_universal=$(echo "$file_info" | /usr/bin/grep -c "Mach-O.*universal")
+        if [ "$is_universal" -eq 0 ]; then
+            echo "  ${RED}FAIL${RESET}: $binary - not universal"
+            failed=$((failed + 1))
+            continue
+        fi
+
+        has_arm64=$(echo "$file_info" | /usr/bin/grep -c "arm64")
+        has_x86_64=$(echo "$file_info" | /usr/bin/grep -c "x86_64")
+        if [ "$has_arm64" -eq 0 ] || [ "$has_x86_64" -eq 0 ]; then
+            echo "  ${RED}FAIL${RESET}: $binary - missing architectures"
+            failed=$((failed + 1))
+        fi
+    done <<< "$executable_files"
+
+    echo
+    if [ $failed -gt 0 ]; then
+        echo "  ${RED}Verification FAILED: $failed universal binary issues found${RESET}"
+        exit 1
+    else
+        echo "  ${GREEN}All Mach-O binaries verified as universal (arm64 + x86_64)${RESET}"
+    fi
+}
+
 main() {
     install_modules
-    
+
     echo ""
     echo "==== Performing post-installation cleanup ===="
     echo ""
-    
+
     remove_pycache
     fix_helper_shebangs
     make_relocatable
     strip_debug_symbols
+    verify_universal_binaries
 }
 
 main
