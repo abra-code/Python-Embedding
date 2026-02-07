@@ -143,6 +143,7 @@ remove_component() {
     local lib_dir="$2"
     local dynload="$3"
     local site_pkgs="$4"
+    local removed=false
     
     echo "Processing component: $comp"
 
@@ -156,7 +157,7 @@ remove_component() {
         return
     fi
 
-	# Remove include headers dir
+    # Remove include headers dir
     if [[ "$comp" == "include" ]]; then
         echo "  Removing $PYTHON_DIR/include"
         /bin/rm -rf "$PYTHON_DIR/include"
@@ -164,9 +165,68 @@ remove_component() {
         return
     fi
 
-    local removed=false
+    # Remove pydoc_data
+    if [[ "$comp" == "pydoc" ]]; then
+        if [ -d "$lib_dir/pydoc_data" ]; then
+            echo "  Removing $lib_dir/pydoc_data"
+            /bin/rm -rf "$lib_dir/pydoc_data"
+            removed=true
+        fi
+    fi
 
-	# Remove East Asian codecs
+    # Remove hashlib-related .so files (blake2, sha, md5, hmac)
+    if [[ "$comp" == "hashlib" ]]; then
+        local hashlib_removed=false
+        for hashlib_so in _blake2 _sha1 _sha2 _sha3 _md5 _hmac; do
+            local so_file="$dynload/${hashlib_so}.cpython-314-darwin.so"
+            if [ -f "$so_file" ]; then
+                echo "  Removing: $so_file"
+                /bin/rm -f "$so_file"
+                hashlib_removed=true
+            fi
+        done
+        if $hashlib_removed; then
+            removed=true
+        fi
+    fi
+
+    # Remove xml-related .so files (elementtree, pyexpat)
+    if [[ "$comp" == "xml" ]]; then
+        local xml_removed=false
+        if [ -f "$dynload/_elementtree.cpython-314-darwin.so" ]; then
+            echo "  Removing: $dynload/_elementtree.cpython-314-darwin.so"
+            /bin/rm -f "$dynload/_elementtree.cpython-314-darwin.so"
+            xml_removed=true
+        fi
+        if [ -f "$dynload/pyexpat.cpython-314-darwin.so" ]; then
+            echo "  Removing: $dynload/pyexpat.cpython-314-darwin.so"
+            /bin/rm -f "$dynload/pyexpat.cpython-314-darwin.so"
+            xml_removed=true
+        fi
+        if $xml_removed; then
+            removed=true
+        fi
+    fi
+
+    # Remove _lsprof.cpython-314-darwin.so (profiling)
+    if [[ "$comp" == "lsprof" ]]; then
+        if [ -f "$dynload/_lsprof.cpython-314-darwin.so" ]; then
+            echo "  Removing: $dynload/_lsprof.cpython-314-darwin.so"
+            /bin/rm -f "$dynload/_lsprof.cpython-314-darwin.so"
+            removed=true
+        fi
+    fi
+
+    # Remove _statistics.cpython-314-darwin.so (statistics module)
+    if [[ "$comp" == "statistics" ]]; then
+        if [ -f "$dynload/_statistics.cpython-314-darwin.so" ]; then
+            echo "  Removing: $dynload/_statistics.cpython-314-darwin.so"
+            /bin/rm -f "$dynload/_statistics.cpython-314-darwin.so"
+            removed=true
+        fi
+    fi
+
+    # Remove East Asian codecs
     if [[ "$comp" == "codecs_east_asian" ]]; then
         local codec
         for codec in jp cn hk kr tw; do
@@ -220,32 +280,30 @@ remove_component() {
         done <<< "$so_files"
     fi
 
-    # Handle site-packages special cases
-    if [[ "$comp" == "pip" || "$comp" == "setuptools" || "$comp" == "certifi" ]]; then
-        local site_items=$(/usr/bin/find "$site_pkgs" -maxdepth 1 -name "${comp}*" 2>/dev/null || echo "")
-        
-        if [ -n "$site_items" ]; then
+    # Handle site-packages (for packages installed via pip)
+    local site_items=$(/usr/bin/find "$site_pkgs" -maxdepth 1 -name "${comp}*" 2>/dev/null || echo "")
+    
+    if [ -n "$site_items" ]; then
+        local item
+        while IFS= read -r item; do
+            [ -z "$item" ] && continue
+            echo "  Removing site-packages item: $item"
+            /bin/rm -rf "$item"
+            removed=true
+        done <<< "$site_items"
+    fi
+    
+    # Special: if removing pip, also remove universalPip (installed conditionally in build)
+    if [[ "$comp" == "pip" ]]; then
+        local upip_items=$(/usr/bin/find "$site_pkgs" -maxdepth 1 -name "universalPip*" -o -name "uPip*" 2>/dev/null || echo "")
+        if [ -n "$upip_items" ]; then
             local item
             while IFS= read -r item; do
                 [ -z "$item" ] && continue
-                echo "  Removing site-packages item: $item"
+                echo "  Removing universalPip/uPip: $item (removed with pip)"
                 /bin/rm -rf "$item"
                 removed=true
-            done <<< "$site_items"
-        fi
-		
-		# Special: if removing pip, also remove universalPip (installed conditionally in build)
-        if [[ "$comp" == "pip" ]]; then
-            local upip_items=$(/usr/bin/find "$site_pkgs" -maxdepth 1 -name "universalPip*" -o -name "uPip*" 2>/dev/null || echo "")
-            if [ -n "$upip_items" ]; then
-                local item
-                while IFS= read -r item; do
-                    [ -z "$item" ] && continue
-                    echo "  Removing universalPip/uPip: $item (removed with pip)"
-                    /bin/rm -rf "$item"
-                    removed=true
-                done <<< "$upip_items"
-            fi
+            done <<< "$upip_items"
         fi
     fi
 
@@ -262,6 +320,49 @@ remove_component() {
         echo "  No matching files found for '$comp'"
     fi
     echo
+}
+
+remove_bin_scripts_for_component() {
+    local comp="$1"
+    local bin_dir="${PYTHON_DIR}/bin"
+    
+    if [ ! -d "$bin_dir" ]; then
+        return
+    fi
+    
+    # Special case: uPip is removed when pip is removed
+    if [[ "$comp" == "pip" ]]; then
+        if [ -e "$bin_dir/uPip" ]; then
+            echo "  Removing bin script: uPip"
+            /bin/rm -f "$bin_dir/uPip"
+        fi
+    fi
+    
+    local script
+    while IFS= read -r script; do
+        [ -z "$script" ] && continue
+        
+        local script_name=$(basename "$script")
+        
+        # Skip symlinks to python (like python3 -> python3.14)
+        if [ -L "$script" ]; then
+            continue
+        fi
+        
+        # Skip actual binary files (check first bytes for shebang)
+        local first_bytes=$(head -c 2 "$script" 2>/dev/null || echo "")
+        if [ "$first_bytes" != "#!" ]; then
+            continue
+        fi
+        
+        # Check if script imports the component
+        if grep -q "^import \\|^from .* import" "$script" 2>/dev/null; then
+            if grep -qw "${comp}" "$script" 2>/dev/null; then
+                echo "  Removing bin script: $script_name"
+                /bin/rm -f "$script"
+            fi
+        fi
+    done < <(/usr/bin/find "$bin_dir" -maxdepth 1 -type f ! -name "python*" ! -name "watchmedo" 2>/dev/null || echo "")
 }
 
 check_and_remove_libcrypto() {
@@ -301,6 +402,7 @@ thin_components() {
     local comp
     for comp in "${components[@]}"; do
         remove_component "$comp" "$lib_dir" "$dynload" "$site_pkgs"
+        remove_bin_scripts_for_component "$comp"
     done
     
     check_and_remove_libcrypto "${components[@]}"
