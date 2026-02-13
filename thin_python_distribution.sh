@@ -338,31 +338,52 @@ remove_bin_scripts_for_component() {
         fi
     fi
     
-    local script
-    while IFS= read -r script; do
-        [ -z "$script" ] && continue
+    # Get all files (excluding python*)
+    local files=$(/usr/bin/find "$bin_dir" -maxdepth 1 -type f ! -name "python*" 2>/dev/null || echo "")
+    # Get all symlinks (excluding python*)
+    local symlinks=$(/usr/bin/find "$bin_dir" -maxdepth 1 -type l ! -name "python*" 2>/dev/null || echo "")
+    
+    # First pass: process actual files
+    local file
+    while IFS= read -r file; do
+        [ -z "$file" ] && continue
         
-        local script_name=$(basename "$script")
+        local file_name=$(basename "$file")
         
-        # Skip symlinks to python (like python3 -> python3.14)
-        if [ -L "$script" ]; then
-            continue
-        fi
-        
-        # Skip actual binary files (check first bytes for shebang)
-        local first_bytes=$(head -c 2 "$script" 2>/dev/null || echo "")
+        # Skip files without shebang
+        local first_bytes=$(/usr/bin/head -c 2 "$file" 2>/dev/null || echo "")
         if [ "$first_bytes" != "#!" ]; then
             continue
         fi
         
         # Check if script imports the component
-        if grep -q "^import \\|^from .* import" "$script" 2>/dev/null; then
-            if grep -qw "${comp}" "$script" 2>/dev/null; then
-                echo "  Removing bin script: $script_name"
-                /bin/rm -f "$script"
+        local import_lines=$(/usr/bin/grep -E "^import |^from .* import" "$file" 2>/dev/null || echo "")
+        
+        if [ -n "$import_lines" ]; then
+            local has_comp=$(/usr/bin/grep -qw "${comp}" <<< "$import_lines" && echo "yes" || echo "no")
+            if [ "$has_comp" = "yes" ]; then
+                echo "  Removing bin script: $file_name"
+                /bin/rm -f "$file"
             fi
         fi
-    done < <(/usr/bin/find "$bin_dir" -maxdepth 1 -type f ! -name "python*" ! -name "watchmedo" 2>/dev/null || echo "")
+    done <<< "$files"
+    
+    # Second pass: clean up symlinks (now that target files may be removed)
+    local link
+    while IFS= read -r link; do
+        [ -z "$link" ] && continue
+        
+        local link_name=$(basename "$link")
+        local target=$(/usr/bin/readlink "$link" 2>/dev/null || echo "")
+        local link_dir=$(dirname "$link")
+        
+        # Remove broken symlinks (target doesn't exist)
+        (cd "$link_dir" && [ ! -e "$target" ])
+        if [ $? -eq 0 ]; then
+            echo "  Removing broken symlink: $link_name -> $target"
+            /bin/rm -f "$link"
+        fi
+    done <<< "$symlinks"
 }
 
 check_and_remove_libcrypto() {
@@ -406,6 +427,37 @@ thin_components() {
     done
     
     check_and_remove_libcrypto "${components[@]}"
+}
+
+verify_no_broken_symlinks() {
+    echo "Verifying no broken symlinks exist..."
+    
+    local broken_links=()
+    while IFS= read -r link; do
+        [ -z "$link" ] && continue
+        local target=$(/usr/bin/readlink "$link")
+        local link_dir=$(dirname "$link")
+        (cd "$link_dir" && [ ! -e "$target" ])
+        if [ $? -eq 0 ]; then
+            broken_links=("${broken_links[@]}" "$link")
+        fi
+    done < <(/usr/bin/find "$PYTHON_DIR" -type l 2>/dev/null || echo "")
+    
+    if [ ${#broken_links[@]} -gt 0 ]; then
+        echo "  Found broken symlinks:"
+        local link
+        for link in "${broken_links[@]}"; do
+            local target=$(/usr/bin/readlink "$link" 2>/dev/null || echo "?")
+            echo "    $link -> $target"
+        done
+        echo
+        echo "  ERROR: Broken symlinks found - this will cause Gatekeeper to reject the app"
+        echo "  Please report this bug with details of which component caused this."
+        exit 1
+    fi
+    
+    echo "  No broken symlinks found."
+    echo
 }
 
 main() {
