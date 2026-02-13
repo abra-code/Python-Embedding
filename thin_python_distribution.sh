@@ -46,6 +46,7 @@ Common optional removals (verify your app/scripts do not need them):
   certifi         - CA certificate bundle (breaks HTTPS verification if removed)
   include         - "include" headers for building some modules (not needed in sealed Python package)
   pyc             - all __pycache__ dirs + *.pyc / *.pyo files (useful after pip install)
+  dist-info       - pip metadata directories (*.dist-info; created by pip install)
 
   codecs_east_asian - East-Asian text encodings (_codecs_jp/cn/hk/kr/tw.so; ~800KB total)
 
@@ -161,6 +162,21 @@ remove_component() {
     if [[ "$comp" == "include" ]]; then
         echo "  Removing $PYTHON_DIR/include"
         /bin/rm -rf "$PYTHON_DIR/include"
+        echo
+        return
+    fi
+
+    # Remove dist-info directories
+    if [[ "$comp" == "dist-info" ]]; then
+        local dist_info_dirs=$(/usr/bin/find "$PYTHON_DIR" -type d -name "*-*.dist-info" 2>/dev/null || echo "")
+        if [ -n "$dist_info_dirs" ]; then
+            local dir
+            while IFS= read -r dir; do
+                [ -z "$dir" ] && continue
+                echo "  Removing dist-info: $dir"
+                /bin/rm -rf "$dir"
+            done <<< "$dist_info_dirs"
+        fi
         echo
         return
     fi
