@@ -73,6 +73,18 @@ def test_compression():
     print("gzip compressed len:", len(gzip.compress(data)))
     print("bz2 compressed len:", len(bz2.compress(data)))
 
+def test_lzma():
+    import lzma
+    data = b"The quick brown fox jumps over the lazy dog. " * 50
+    compressed = lzma.compress(data)
+    decompressed = lzma.decompress(compressed)
+    assert decompressed == data, "lzma round-trip mismatch"
+    print(f"lzma compressed {len(data)} -> {len(compressed)} bytes")
+    # Also verify .xz format filter works
+    compressed_xz = lzma.compress(data, format=lzma.FORMAT_XZ)
+    assert lzma.decompress(compressed_xz) == data
+    print("lzma FORMAT_XZ round-trip OK")
+
 def test_json():
     import json
     obj = {"unicode": "żółw", "num": 3.14, "list": [1, 2, 3]}
@@ -128,6 +140,13 @@ run_test("SQLite3", test_sqlite3)
 run_test("Threading", test_threading)
 run_test("Multiprocessing", test_multiprocessing)
 run_test("Compression (zlib/gzip/bz2)", test_compression)
+try:
+    import _lzma
+    run_test("LZMA compression", test_lzma)
+except ImportError:
+    print("=== LZMA compression ===")
+    print("SKIP (lzma not available — build with --lzma-version to enable)")
+    print()
 run_test("JSON round-trip", test_json)
 run_test("ctypes (libc load)", test_ctypes)
 run_test("Decimal precision", test_decimal)

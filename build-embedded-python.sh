@@ -11,6 +11,7 @@ RESET=$(printf '\033[0m')
 VERSION="auto"
 ARCH="universal"
 OPENSSL_VERSION="auto"
+XZ_VERSION="none"
 FINAL_DIR=""
 
 show_help() {
@@ -23,12 +24,16 @@ Options:
                       Note: cross-compilation, e.g. building x86_64 on Apple Silicon Macs
                             is not supported by Python build system. Build universal instead
   --openssl-version=VERSION   OpenSSL version (default: auto-detect latest stable)
+  --lzma-version=VERSION      Build and statically link liblzma (xz-utils) at given version.
+                              Use "auto" to auto-detect, or a specific version like "5.6.4".
+                              Omit this flag to skip lzma (default: not built)
   --output=path/to/final/dir  Optional path to final directory to place built products
   --help              Show this help message
 
 Example:
   ./build-embedded-python.sh --version=3.13.0 --arch=arm64
   ./build-embedded-python.sh --version=auto --arch=universal
+  ./build-embedded-python.sh --version=auto --lzma-version=auto
 EOF
     exit 0
 }
@@ -42,6 +47,8 @@ while [[ $# -gt 0 ]]; do
         --arch) shift; ARCH="$1" ;;
         --openssl-version=*) OPENSSL_VERSION="${1#*=}" ;;
         --openssl-version) shift; OPENSSL_VERSION="$1" ;;
+        --lzma-version=*) XZ_VERSION="${1#*=}" ;;
+        --lzma-version) shift; XZ_VERSION="$1" ;;
         --output=*) FINAL_DIR="${1#*=}" ;;
         --output) shift; FINAL_DIR="$1" ;;
 
@@ -153,6 +160,8 @@ prepare() {
     PYTHON_SRC="${BUILD_FLAVOR_DIR}/src"
     OPENSSL_BUILD="${BUILD_FLAVOR_DIR}/openssl-build"
     OPENSSL_INSTALL="${BUILD_FLAVOR_DIR}/openssl-install"
+    XZ_BUILD="${BUILD_FLAVOR_DIR}/xz-build"
+    XZ_INSTALL="${BUILD_FLAVOR_DIR}/xz-install"
     INSTALL_DIR="${BUILD_FLAVOR_DIR}/install"
     if [ -z "$FINAL_DIR" ]; then
         FINAL_DIR="${START_DIR}/Python-${VERSION}-${ARCH}"
@@ -328,6 +337,135 @@ build_openssl() {
     fi
 }
 
+detect_latest_xz() {
+    echo "Detecting latest stable xz version..."
+
+    local latest_url
+    latest_url=$(/usr/bin/curl -s --head -w '%{redirect_url}' https://github.com/tukaani-project/xz/releases/latest 2>/dev/null || echo "")
+
+    if [[ "$latest_url" =~ /tag/v([^/]+)$ ]]; then
+        XZ_VERSION="${BASH_REMATCH[1]}"
+        echo "  Detected: $XZ_VERSION"
+    else
+        XZ_VERSION="5.8.3"
+        echo "  ${RED}Detection failed — falling back to $XZ_VERSION${RESET}"
+    fi
+    echo
+}
+
+download_xz() {
+    [ "$XZ_VERSION" = "none" ] && return 0
+
+    echo
+    echo "==== Downloading xz-utils ===="
+    echo
+
+    if [[ "$XZ_VERSION" == "auto" ]]; then
+        detect_latest_xz
+    fi
+
+    local tarball="$DOWNLOAD_DIR/xz-${XZ_VERSION}.tar.gz"
+    local url="https://github.com/tukaani-project/xz/releases/download/v${XZ_VERSION}/xz-${XZ_VERSION}.tar.gz"
+
+    echo "Downloading xz-utils source (${XZ_VERSION})..."
+    cd "$DOWNLOAD_DIR"
+
+    if [ -f "$tarball" ]; then
+        echo "  xz tarball already present in downloads"
+    else
+        /usr/bin/curl -L --fail --show-error -o "$tarball" "$url"
+    fi
+
+    echo "  Unpacking xz source..."
+    local xz_src_dir="$BUILD_FLAVOR_DIR/xz-src"
+    /bin/rm -rf "$xz_src_dir"
+    /bin/mkdir -pv "$xz_src_dir"
+    /usr/bin/tar xf "$tarball" -C "$xz_src_dir" --strip-components=1
+}
+
+build_xz() {
+    [ "$XZ_VERSION" = "none" ] && return 0
+
+    echo
+    echo "==== Building xz-utils ${XZ_VERSION} as static library ===="
+    echo
+
+    export MACOSX_DEPLOYMENT_TARGET
+
+    cd "$BUILD_FLAVOR_DIR"
+    /bin/rm -rf "$XZ_BUILD" "$XZ_INSTALL"
+    /bin/mkdir -pv "$XZ_BUILD" "$XZ_INSTALL"
+
+    local target_archs=()
+    if [ "$ARCH" = "universal" ]; then
+        target_archs=("x86_64" "arm64")
+    elif [ "$ARCH" = "arm64" ]; then
+        target_archs=("arm64")
+    else
+        target_archs=("x86_64")
+    fi
+
+    local per_arch_installs=()
+    for host_arch in "${target_archs[@]}"; do
+        local arch_build="${XZ_BUILD}/${host_arch}"
+        local arch_install="${XZ_BUILD}/${host_arch}-install"
+        /bin/mkdir -pv "$arch_build" "$arch_install"
+        per_arch_installs+=("$arch_install")
+
+        cd "$arch_build"
+
+        echo "Configuring xz for $host_arch (static only)..."
+        CC="/usr/bin/clang -arch $host_arch" \
+        "$BUILD_FLAVOR_DIR/xz-src/configure" \
+            --prefix="$arch_install" \
+            --disable-shared \
+            --enable-static \
+            --with-pic \
+            --disable-xz \
+            --disable-xzdec \
+            --disable-lzmadec \
+            --disable-lzmainfo \
+            --disable-scripts \
+            --disable-doc \
+            --host="$host_arch-apple-darwin"
+
+        /usr/bin/make -j8
+        /usr/bin/make install
+        cd "$BUILD_FLAVOR_DIR"
+    done
+
+    # Copy first arch install as base
+    /bin/cp -R "${per_arch_installs[0]}/"* "$XZ_INSTALL/"
+
+    if [ "$ARCH" = "universal" ]; then
+        echo "Creating universal static library via lipo..."
+        /usr/bin/lipo -create \
+            "${per_arch_installs[0]}/lib/liblzma.a" \
+            "${per_arch_installs[1]}/lib/liblzma.a" \
+            -output "$XZ_INSTALL/lib/liblzma.a"
+    fi
+
+    echo "  Static liblzma built at: $XZ_INSTALL/lib/liblzma.a"
+    /usr/bin/file "$XZ_INSTALL/lib/liblzma.a"
+}
+
+setup_lzma_module() {
+    [ "$XZ_VERSION" = "none" ] && return 0
+
+    echo
+    echo "==== Configuring _lzma module for static liblzma linkage ===="
+    echo
+
+    local setup_local="$PYTHON_SRC/Modules/Setup.local"
+    # *shared* marker makes the module build as a .so in lib-dynload/ rather than
+    # being compiled statically into libpython. The liblzma.a is still linked
+    # statically into _lzma.so itself, so there is no dynamic liblzma dependency.
+    printf '*shared*\n_lzma _lzmamodule.c -I%s/include %s/lib/liblzma.a\n' \
+        "$XZ_INSTALL" "$XZ_INSTALL" >> "$setup_local"
+    echo "  Written to $setup_local:"
+    /bin/cat "$setup_local"
+}
+
 copy_and_relocate_openssl_dylibs() {
     echo
     echo "==== Copying and relocating bundled OpenSSL shared libraries ===="
@@ -381,6 +519,14 @@ configure_python() {
     )
 
     flags+=(MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET})
+
+    if [ "$XZ_VERSION" != "none" ]; then
+        # Point Python's configure at the static liblzma headers/lib so it can
+        # find lzma.h. Since only liblzma.a exists (--disable-shared), the linker
+        # will always pick the static archive.
+        flags+=(CPPFLAGS="-I${XZ_INSTALL}/include")
+        flags+=(LDFLAGS="-L${XZ_INSTALL}/lib")
+    fi
 
     if [ "$ARCH" = "universal" ]; then
         flags+=(--enable-universalsdk --with-universal-archs=universal2)
@@ -527,6 +673,38 @@ relocate_ssl_extensions() {
             done <<< "$old_crypto_paths"
         fi
     done
+}
+
+verify_lzma_static() {
+    [ "$XZ_VERSION" = "none" ] && return 0
+
+    echo
+    echo "==== Verifying _lzma has no dynamic liblzma dependency ===="
+    echo
+
+    local dynload_dir="$INSTALL_DIR/lib/python${MAJOR_MINOR}/lib-dynload"
+    local found_lzma=false
+
+    for ext in "$dynload_dir"/_lzma*.so; do
+        [ -f "$ext" ] || continue
+        found_lzma=true
+
+        echo "  Checking: $ext"
+        local lzma_dylib_ref
+        lzma_dylib_ref=$(/usr/bin/otool -L "$ext" | /usr/bin/grep "liblzma" || echo "")
+
+        if [ -n "$lzma_dylib_ref" ]; then
+            echo "  ${RED}FAIL: _lzma has dynamic dependency on liblzma:${RESET}"
+            echo "  $lzma_dylib_ref"
+            exit 1
+        else
+            echo "  ${GREEN}OK: no dynamic liblzma dependency${RESET}"
+        fi
+    done
+
+    if ! $found_lzma; then
+        echo "  ${RED}WARNING: _lzma extension not found in lib-dynload${RESET}"
+    fi
 }
 
 install_additional_modules() {
@@ -740,12 +918,16 @@ main() {
     download_python
     download_openssl
     build_openssl
+    download_xz
+    build_xz
+    setup_lzma_module
     configure_python
     build_and_install
     fix_pkgconfig
     make_relocatable
     copy_and_relocate_openssl_dylibs
     relocate_ssl_extensions
+    verify_lzma_static
     install_additional_modules
     fix_helper_shebangs
     strip_debug_symbols
