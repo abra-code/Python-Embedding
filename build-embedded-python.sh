@@ -217,6 +217,47 @@ detect_latest_openssl() {
     echo
 }
 
+detect_latest_openssl_36x() {
+    echo "  Detecting latest stable OpenSSL 3.6.x version..."
+    local releases_json
+    releases_json=$(/usr/bin/curl -s --fail --max-time 10 \
+        "https://api.github.com/repos/openssl/openssl/releases?per_page=50" 2>/dev/null || echo "")
+
+    if [ -n "$releases_json" ]; then
+        local latest_36x
+        latest_36x=$(echo "$releases_json" | \
+            /usr/bin/grep -oE '"tag_name":\s*"openssl-3\.6\.[0-9]+"' | \
+            /usr/bin/grep -oE '3\.6\.[0-9]+' | \
+            /usr/bin/sort -V | \
+            /usr/bin/tail -1)
+
+        if [[ "$latest_36x" =~ ^3\.6\.[0-9]+$ ]]; then
+            OPENSSL_VERSION="$latest_36x"
+            echo "  Detected: $OPENSSL_VERSION"
+            return 0
+        fi
+    fi
+
+    OPENSSL_VERSION="3.6.2"
+    echo "  ${RED}Detection failed — falling back to $OPENSSL_VERSION${RESET}"
+}
+
+# Python 3.14.x and earlier are incompatible with OpenSSL 4.x (fixed in Python 3.15+).
+# If a forbidden combination is detected, cap OpenSSL to the latest 3.6.x series.
+enforce_openssl_version_constraint() {
+    local python_minor openssl_major
+    python_minor=$(echo "$MAJOR_MINOR" | cut -d. -f2)
+    openssl_major=$(echo "$OPENSSL_VERSION" | cut -d. -f1)
+
+    if [ "$python_minor" -lt 15 ] && [ "$openssl_major" -ge 4 ]; then
+        echo "  ${RED}WARNING: OpenSSL ${OPENSSL_VERSION} is not compatible with Python ${VERSION}.${RESET}"
+        echo "  Python < 3.15 requires OpenSSL 3.x (OpenSSL 4.x support is expected in Python 3.15+)."
+        echo "  Capping OpenSSL to the latest 3.6.x series..."
+        detect_latest_openssl_36x
+        echo
+    fi
+}
+
 
 download_openssl() {
     echo
@@ -226,6 +267,8 @@ download_openssl() {
     if [[ "$OPENSSL_VERSION" == "auto" ]]; then
         detect_latest_openssl
     fi
+
+    enforce_openssl_version_constraint
 
     local tarball="$DOWNLOAD_DIR/openssl-${OPENSSL_VERSION}.tar.gz"
     local url="https://www.openssl.org/source/${tarball##*/}"
@@ -869,20 +912,50 @@ rename_build_artifacts() {
     /bin/mv -v "$BUILD_FLAVOR_DIR" "${BUILD_FLAVOR_DIR}.last"
 }
 
+verify_python_symlinks() {
+    echo
+    echo "==== Verifying python3 symlink ===="
+    echo
+
+    local python3_link="$FINAL_DIR/bin/python3"
+
+    if [ ! -e "$python3_link" ]; then
+        echo "  ${RED}FATAL: python3 symlink not found at $python3_link${RESET}"
+        echo "  Contents of $FINAL_DIR/bin/:"
+        /bin/ls -la "$FINAL_DIR/bin/" 2>/dev/null || echo "  (bin/ directory not found)"
+        exit 1
+    fi
+
+    if [ ! -x "$python3_link" ]; then
+        echo "  ${RED}FATAL: $python3_link exists but is not executable${RESET}"
+        exit 1
+    fi
+
+    echo "  ${GREEN}OK: python3 found at $python3_link${RESET}"
+    /bin/ls -la "$python3_link"
+}
+
 run_tests() {
     echo
     echo "==== Running basic sanity tests on the built Python ===="
     echo
 
     local test_script="${SCRIPT_DIR}/test_custom_python.py"
+    local python_bin="$FINAL_DIR/bin/python3"
 
     if [ ! -f "$test_script" ]; then
         echo "Warning: Test script not found at $test_script - skipping tests"
         return 0
     fi
 
-    echo "  Executing: $FINAL_DIR/bin/python${MAJOR_MINOR} $test_script"
-    "$FINAL_DIR/bin/python${MAJOR_MINOR}" "$test_script"
+    echo "  Executing: $python_bin $test_script"
+    "$python_bin" "$test_script"
+    local test_exit=$?
+    if [ $test_exit -ne 0 ]; then
+        echo
+        echo "  ${RED}FATAL: sanity tests failed — see output above${RESET}"
+        exit 1
+    fi
 
     if [ "$ARCH" = "universal" ]; then
         local build_arch
@@ -892,8 +965,14 @@ run_tests() {
             local is_rosetta_available=$(/usr/bin/arch -x86_64 /usr/bin/uname -m)
             if [ "$is_rosetta_available" = "x86_64" ]; then
                 echo "  Executing Intel code under Rosetta to verify universal binary:"
-                echo "  arch --x86_64 $FINAL_DIR/bin/python${MAJOR_MINOR} $test_script"
-                /usr/bin/arch --x86_64 "$FINAL_DIR/bin/python${MAJOR_MINOR}" "$test_script"
+                echo "  arch --x86_64 $python_bin $test_script"
+                /usr/bin/arch --x86_64 "$python_bin" "$test_script"
+                local rosetta_exit=$?
+                if [ $rosetta_exit -ne 0 ]; then
+                    echo
+                    echo "  ${RED}FATAL: sanity tests failed under Rosetta — see output above${RESET}"
+                    exit 1
+                fi
             fi
         fi
     fi
@@ -935,6 +1014,7 @@ main() {
     finalize
     rename_build_artifacts
     verify_universal_binaries
+    verify_python_symlinks
     run_tests
     print_summary
 }
