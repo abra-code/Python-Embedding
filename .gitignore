@@ -1,4 +1,5 @@
 .DS_Store
+Private
 build/**
 wheels/
 Python-*/
