@@ -340,6 +340,7 @@ build_openssl() {
     fi
 
     local per_arch_installs=()
+    local host_arch
     for host_arch in "${target_archs[@]}"; do
         local arch_build="${OPENSSL_BUILD}/${host_arch}"
         local arch_install="${OPENSSL_BUILD}/${host_arch}-install"
@@ -449,6 +450,7 @@ build_xz() {
     fi
 
     local per_arch_installs=()
+    local host_arch
     for host_arch in "${target_archs[@]}"; do
         local arch_build="${XZ_BUILD}/${host_arch}"
         local arch_install="${XZ_BUILD}/${host_arch}-install"
@@ -531,6 +533,7 @@ copy_and_relocate_openssl_dylibs() {
     crypto_refs=$( /usr/bin/otool -L libssl.dylib | /usr/bin/awk '/libcrypto/ {print $1}' )
     
     if [ -n "$crypto_refs" ]; then
+        local crypto_ref
         while IFS= read -r crypto_ref; do
             [ -z "$crypto_ref" ] && continue
             echo "    Changing: $crypto_ref -> @executable_path/../lib/libcrypto.dylib"
@@ -604,6 +607,7 @@ fix_helper_shebangs() {
     local bin_dir="$INSTALL_DIR/bin"
     local python_shebang="#!/usr/bin/env python3"
 
+    local script
     for script in "$bin_dir"/*; do
         # Skip non-regular files and symlinks
         [ -f "$script" ] || continue
@@ -622,6 +626,7 @@ fix_pkgconfig() {
     echo "Fixing absolute paths in pkg-config files..."
     local pc_dir="$INSTALL_DIR/lib/pkgconfig"
 
+    local pc
     for pc in "$pc_dir"/*.pc; do
         [ -f "$pc" ] || continue
         [ -L "$pc" ] && continue  # skip symlinks
@@ -683,6 +688,8 @@ relocate_ssl_extensions() {
         return 0
     fi
 
+    local ext
+    local old_path
     for ext in _ssl*.so _hashlib*.so; do
         [ -f "$ext" ] || continue
 
@@ -728,6 +735,7 @@ verify_lzma_static() {
     local dynload_dir="$INSTALL_DIR/lib/python${MAJOR_MINOR}/lib-dynload"
     local found_lzma=false
 
+    local ext
     for ext in "$dynload_dir"/_lzma*.so; do
         [ -f "$ext" ] || continue
         found_lzma=true

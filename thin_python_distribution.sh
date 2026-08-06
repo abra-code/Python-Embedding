@@ -193,6 +193,7 @@ remove_component() {
     # Remove hashlib-related .so files (blake2, sha, md5, hmac)
     if [[ "$comp" == "hashlib" ]]; then
         local hashlib_removed=false
+        local hashlib_so
         for hashlib_so in _blake2 _sha1 _sha2 _sha3 _md5 _hmac; do
             local so_file="$dynload/${hashlib_so}.cpython-314-darwin.so"
             if [ -f "$so_file" ]; then

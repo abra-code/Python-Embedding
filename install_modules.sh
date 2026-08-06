@@ -137,6 +137,7 @@ fix_helper_shebangs() {
     local bin_dir="$PYTHON_DIR/bin"
     local python_shebang="#!/usr/bin/env python3"
 
+    local script
     for script in "$bin_dir"/*; do
         # Skip non-regular files and symlinks
         [ -f "$script" ] || continue
@@ -165,6 +166,7 @@ make_relocatable() {
         return
     fi
 
+    local file
     while IFS= read -r file; do
         # Skip empty lines (in case find adds trailing newline)
         [ -z "$file" ] && continue
@@ -177,6 +179,7 @@ make_relocatable() {
         local dependencies=$(/usr/bin/otool -L "$file" | /usr/bin/awk '/^[ \t]+[\/@]/ {print $1}')
 
         local file_changed=0
+        local dep
         while IFS= read -r dep; do
             [ -z "$dep" ] && continue
             if [[ "$dep" == "$PYTHON_DIR/"* ]]; then
