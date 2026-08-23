@@ -26,11 +26,12 @@ MODES (combine freely; all results are unioned into the KEEP set)
   --auto-trace-scripts DIR
                        derive the closure from the app's scripts in DIR, with no
                        hand-written workload. Repeatable. By DEFAULT nothing in DIR is
-                       executed: every *.py is AST-scanned for the imports it names at
-                       any depth, and those are imported directly. Imports of sibling
-                       scripts in the same DIR are dropped as seeds - they are not
-                       dependencies of the distribution, and each sibling is scanned in
-                       its own right anyway.
+                       executed: every Python source file - *.py, and extension-less
+                       files with a python shebang, which is how a CLI helper ships - is
+                       AST-scanned for the imports it names at any depth, and those are
+                       imported directly. Imports of sibling scripts in the same DIR are
+                       dropped as seeds - they are not dependencies of the distribution,
+                       and each sibling is scanned in its own right anyway.
                        --execute-entry-points instead RUNS each script. That adds only
                        the branches which happen to run, and costs executing a handler
                        with none of its usual arguments; in one measured app scanning kept
@@ -42,7 +43,17 @@ MODES (combine freely; all results are unioned into the KEEP set)
   __import__(name), a codec looked up by string - is invisible to both modes, because
   the name is not in the source. -X importtime does not even log import_module's target
   (only its nested C extension), so tracing does not save you either. Use --keep for
-  those.
+  those. A forced name is IMPORTED, not just listed, so whatever it needs is kept with
+  it; if it belongs to the distribution being thinned it also becomes a verification
+  seed, and if it cannot be imported at all it is recorded as already-missing, which
+  means a typo there is silently inert rather than an error.
+  --scan-app-code DIR  read (never run) the app's own text under DIR to find entry points
+                       nothing declares. Repeatable. Two finds: `python -m NAME` launches
+                       into --packages, and extension-less files with a python shebang -
+                       CLI helpers that a handler or a shell script starts BY PATH, so no
+                       `-m` and no import statement anywhere names them. Each such tool's
+                       DIRECTORY is then analysed exactly as --auto-trace-scripts would,
+                       which is what reads the package sitting beside it.
   --trace "CMD ARGS"   run CMD under the embedded interpreter with -X importtime and
                        record every module imported. Repeatable. CMD's first token is
                        usually a bin script (e.g. .../bin/watchmedo) or a .py file.
@@ -323,16 +334,59 @@ def _run_trace(python_bin, parts, timeout, iso=None):
     return _parse_importtime(text), _parse_importtime(text, dotted=True), text
 
 
-def _py_files_under(root):
-    """Every .py at any depth, so a package sibling's dependencies are read too."""
+def has_python_shebang(path):
+    """True for a file whose first line is a `#!` naming python.
+
+    A command-line tool is normally shipped WITHOUT the .py, so an extension test alone
+    misses exactly the files that are entry points. Read as bytes and only the first
+    line: the tree being walked also holds Mach-O binaries and multi-megabyte data files,
+    and neither needs decoding to answer this."""
+    try:
+        with open(path, "rb") as f:
+            first = f.readline(256)
+    except OSError:
+        return False
+    return first.startswith(b"#!") and b"python" in first.lower()
+
+
+def is_python_source(path):
+    """A .py, or an extension-less file with a python shebang. Both are Python source
+    that the app runs, so both are scanned - and, under --execute-entry-points, run."""
+    fn = os.path.basename(path)
+    if not os.path.isfile(path):
+        return False          # a directory named *.py is not a script to run
+    if fn.endswith(".py"):
+        return True
+    return "." not in fn and has_python_shebang(path)
+
+
+def canon(path):
+    """Canonical absolute path. `abspath` alone does not resolve symlinks, and on macOS
+    that is not academic: a caller's /tmp/... never matches a walk of /private/tmp/...,
+    and a symlinked tool reports the directory of the LINK rather than of the file, which
+    is not where its sibling package lives."""
+    return os.path.realpath(os.path.abspath(path))
+
+
+def _py_files_under(root, exclude=()):
+    """Every Python source file at any depth, so a package sibling's dependencies are
+    read too. `exclude` drops whole subtrees - a tool discovered high in a bundle would
+    otherwise drag the installed Packages and the interpreter's own stdlib into the
+    app's seed set, where they are audited and thinned by different rules."""
+    exclude = tuple(canon(e) for e in exclude if e)
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
+        ap = canon(dirpath)
+        if any(ap == e or ap.startswith(e + os.sep) for e in exclude):
+            dirnames[:] = []
+            continue
         dirnames[:] = [d for d in dirnames if d != "__pycache__"]
-        out += [os.path.join(dirpath, fn) for fn in filenames if fn.endswith(".py")]
+        out += [p for p in (os.path.join(dirpath, fn) for fn in filenames)
+                if is_python_source(p)]
     return out
 
 
-def all_imports_of_dir(scripts_dir):
+def all_imports_of_dir(scripts_dir, exclude=()):
     """Every import any script names, at any nesting depth, as full dotted names.
     `from X import Y` also yields X.Y, since Y is often a submodule; when it is only a
     function the import fails harmlessly and contributes nothing.
@@ -355,12 +409,16 @@ def all_imports_of_dir(scripts_dir):
 
     So the scan is recursive, and EVERY directory entry is a sibling name - a package or
     a namespace package (a plain directory is importable in Python 3 as well, which an
-    __init__.py test misses and which then produces exactly the false failure above)."""
+    __init__.py test misses and which then produces exactly the false failure above).
+
+    Extension-less files with a python shebang are scanned as source too. A CLI helper is
+    shipped without the .py, so a `.py` test skips the one file in the directory that is
+    actually an entry point - and with it the imports of the package sitting beside it."""
     entries = os.listdir(scripts_dir)
     stems = {fn[:-3] for fn in entries if fn.endswith(".py")}
     stems |= {fn for fn in entries if os.path.isdir(os.path.join(scripts_dir, fn))}
     seeds = set()
-    for path in sorted(_py_files_under(scripts_dir)):
+    for path in sorted(_py_files_under(scripts_dir, exclude)):
         rel = os.path.relpath(path, scripts_dir)
         try:
             with open(path, encoding="utf-8") as f:
@@ -629,7 +687,7 @@ def dynamic_import_sites(roots):
     return sites
 
 
-def imports_only_closure(python_bin, scripts_dir, timeout, iso=None):
+def imports_only_closure(python_bin, scripts_dir, timeout, iso=None, exclude=()):
     """Derive the closure by importing what the scripts import, WITHOUT running them.
 
     An entry point's value to this analysis is its import graph, and every import is a
@@ -645,7 +703,7 @@ def imports_only_closure(python_bin, scripts_dir, timeout, iso=None):
     Module-level code of the imported modules still runs, so the sandbox is still
     required - a bundled server package printed banners and closed stdout on import. What
     stops running is the handler's own body, which is the part that deletes files."""
-    seeds = all_imports_of_dir(scripts_dir)
+    seeds = all_imports_of_dir(scripts_dir, exclude)
     if not seeds:
         return set(), set(), set(), set()
     iso = iso or Isolation()
@@ -740,10 +798,11 @@ def probe_failures(err, mark):
 
 
 def auto_trace_scripts(python_bin, scripts_dir, timeout, iso=None):
-    """Trace every *.py in scripts_dir as its own entry point. Returns
-    (keep_names, per_script, baseline_missing) - the last being the modules that were
-    ALREADY unimportable before any thinning, so verification can tell a pre-existing
-    gap from one this plan created.
+    """Trace every Python script in scripts_dir as its own entry point - *.py, and
+    extension-less files with a python shebang, which is how a CLI helper is shipped.
+    Returns (keep_names, per_script, baseline_missing) - the last being the modules that
+    were ALREADY unimportable before any thinning, so verification can tell a
+    pre-existing gap from one this plan created.
 
     Each script runs in its own subprocess: entry points are not import-safe, and one
     that closes stdout or exits the interpreter would otherwise take the whole scan
@@ -754,7 +813,7 @@ def auto_trace_scripts(python_bin, scripts_dir, timeout, iso=None):
     baseline = set()
     dotted = set()
     for fn in sorted(os.listdir(scripts_dir)):
-        if not fn.endswith(".py"):
+        if not is_python_source(os.path.join(scripts_dir, fn)):
             continue
         names, dots, err = _run_trace(python_bin, [os.path.join(scripts_dir, fn)], timeout, iso)
         per[fn] = len(names)
@@ -964,7 +1023,7 @@ def direct_imports(scripts_dir):
     branches, so we deliberately do not do it.)"""
     names = set()
     for f in sorted(os.listdir(scripts_dir)):
-        if not f.endswith(".py"):
+        if not is_python_source(os.path.join(scripts_dir, f)):
             continue
         try:
             tree = ast.parse(open(os.path.join(scripts_dir, f), encoding="utf-8").read())
@@ -1009,14 +1068,14 @@ def scan_app_code(roots, known, exclude=()):
     one real tree). Binary-ish text like a bundled WebUI .js is excluded too - its JavaScript
     identifiers collide with package names (attr, click, jwt, rich) and bury the signal.
     """
-    exclude = tuple(os.path.abspath(e) for e in exclude if e)
+    exclude = tuple(canon(e) for e in exclude if e)
     dash_m, py_files, mentions, shebangs = set(), set(), {}, []
     patterns = {n: re.compile(r"(?<![\w.])%s(?![\w])" % re.escape(n)) for n in known}
     for root_dir in roots:
         if not os.path.isdir(root_dir):
             continue
         for dirpath, dirnames, filenames in os.walk(root_dir):
-            ap = os.path.abspath(dirpath)
+            ap = canon(dirpath)
             if any(ap == e or ap.startswith(e + os.sep) for e in exclude):
                 dirnames[:] = []
                 continue
@@ -1765,7 +1824,12 @@ def main(argv):
     p.add_argument("--no-inline-conditional", dest="inline_conditional", action="store_false",
                    help="only keep what the trace literally imported (may miss lazy branches)")
     p.add_argument("--runtime-log", action="append", default=[], help="file of module names from your own run")
-    p.add_argument("--keep", default="", help="comma-separated extra top-level names to force-keep")
+    p.add_argument("--keep", default="",
+                   help="comma-separated extra top-level names to force-keep. Each is "
+                        "IMPORTED, so its own dependencies are kept too; one that this "
+                        "distribution provides also becomes a verification seed, and one "
+                        "that cannot be imported at all is recorded as already-missing "
+                        "and never checked again")
     p.add_argument("--plan", default=None,
                    help="resolve removals from this thinning plan instead of tracing (apply mode)")
     p.add_argument("--arch", default="", help="target arch (arm64|x86_64) to record in --print plan")
@@ -1857,12 +1921,14 @@ def main(argv):
     scripts_dir = args.auto_trace_scripts[0] if args.auto_trace_scripts else None
     iso = Isolation(root=args.root, packages=args.packages, scripts=scripts_dir,
                     sandbox_profile=args.sandbox_profile, scratch=args.scratch)
-    if args.auto_trace_scripts and not args.sandbox_profile:
+    def warn_unsandboxed():
         print("# isolation warn: analysing scripts runs module-level code of everything "
               "they import%s; pass --sandbox-profile so a misbehaving module cannot write "
               "or reach the network."
               % (" AND executes each entry point" if args.execute_entry_points else ""),
               file=sys.stderr)
+    if args.auto_trace_scripts and not args.sandbox_profile:
+        warn_unsandboxed()
     if args.check_isolation:
         if not args.root:
             raise SystemExit("--check-isolation requires --root")
@@ -1882,38 +1948,11 @@ def main(argv):
     if pth:
         import_seeds |= pth
         print("# .pth startup imports: %s" % " ".join(sorted(pth)), file=sys.stderr)
-    for d in args.auto_trace_scripts:
-        if args.execute_entry_points:
-            names, per, base_missing, dots = auto_trace_scripts(
-                python_bin, d, args.trace_timeout, iso)
-            per_script.update(per)
-            baseline_missing |= base_missing
-            root = os.path.abspath(args.root) if args.root else None
-            for fn in sorted(per):
-                full = os.path.join(os.path.abspath(d), fn)
-                entry_points.append(os.path.relpath(full, root) if root else full)
-            dead = sorted(fn for fn, n in per.items() if n == 0)
-            if dead:
-                print("# trace warn: these entry points imported nothing (did not start): %s"
-                      % " ".join(dead), file=sys.stderr)
-        else:
-            names, dots, seeds, base_missing = imports_only_closure(
-                python_bin, d, args.trace_timeout, iso)
-            import_seeds |= seeds
-            baseline_missing |= base_missing
-            print("# imports-only: %d import statement(s) across the scripts, %d module(s) "
-                  "loaded (no entry point was executed)" % (len(seeds), len(names)),
-                  file=sys.stderr)
-        keep_trace |= names
-        dotted |= dots
 
-    # Installed packages: the same rule as the app's own scripts. Every import named
-    # anywhere in their source is a dependency, because which FILES of a distribution
-    # load is as much a branch decision as which imports inside a file fire - and the
-    # trace can only tell us about the files it happened to load.
     # Entry points into Packages that only a shell script or a generated config names.
     # Discovered, not declared: this is what lets an app whose real workload is
-    # `python3 -m some_pkg.cli` need no --trace at all.
+    # `python3 -m some_pkg.cli` need no --trace at all. The same sweep finds the app's
+    # shebang tools, so it has to run BEFORE the scripts are analysed rather than after.
     discovered = []
     scan = None
     if args.scan_app_code:
@@ -1931,12 +1970,76 @@ def main(argv):
         if discovered:
             print("# discovered %d out-of-process entry point(s) in app code: %s"
                   % (len(discovered), ", ".join(discovered)), file=sys.stderr)
-        if scan["shebang_tools"]:
-            print("# note: %d extension-less file(s) with a python shebang were seen; they "
-                  "are scanned for names but not executed: %s"
-                  % (len(scan["shebang_tools"]),
-                     " ".join(os.path.basename(p) for p in scan["shebang_tools"][:6])),
+
+    # An extension-less file with a python shebang is an entry point that nothing can
+    # declare: it is launched by path from a handler or a shell script, so no `-m` sweep
+    # and no import statement anywhere names it, and a *.py test walks straight past it.
+    # Its DIRECTORY is adopted rather than the file alone, because the sibling rule that
+    # keeps a scripts dir honest applies here identically - the package sitting beside
+    # the tool is where its real dependencies are written, and seeding the tool's import
+    # of that package instead of reading it would drop the lot.
+    script_dirs = [canon(d) for d in args.auto_trace_scripts]
+    given = set(script_dirs)
+    adopted = {}
+    for tool in (scan or {}).get("shebang_tools", ()):
+        # canon, not abspath: a symlinked tool's SIBLINGS are next to the real file, and
+        # adopting the link's directory instead seeds the package it should have read.
+        d = os.path.dirname(canon(tool))
+        if not any(d == s or d.startswith(s + os.sep) for s in script_dirs):
+            script_dirs.append(d)
+        if d not in given:
+            adopted.setdefault(d, []).append(os.path.basename(tool))
+    if adopted:
+        print("# adopted %d shebang entry point(s) that no import statement names: %s"
+              % (sum(len(v) for v in adopted.values()),
+                 ", ".join("%s (%s)" % (os.path.basename(d) or d, " ".join(sorted(v)))
+                           for d, v in sorted(adopted.items()))), file=sys.stderr)
+        if not args.auto_trace_scripts and not args.sandbox_profile:
+            warn_unsandboxed()
+
+    # Packages and the interpreter's own tree are audited and thinned by different rules,
+    # so a scripts dir must never pull them into the app's seed set - which a tool
+    # discovered high in a bundle otherwise would.
+    #
+    # An adopted directory that CONTAINS another script dir is excluded from it as well.
+    # The sibling rule is computed at the top of the directory being scanned, so walking
+    # Resources/ after adopting a tool there would re-read Resources/Scripts/*.py with
+    # `Scripts` as the only stem - turning lib_icedit, lib_material and lib_debounce into
+    # seeds. They resolve at plan time, because the scripts dir is on PYTHONPATH then,
+    # and fail at verify time, when it is not: apply then fails permanently. Nothing is
+    # lost by excluding them, since each such directory is scanned in its own right.
+    base_exclude = [args.packages, python_dir]
+    for d in script_dirs:
+        scan_exclude = base_exclude + [s for s in script_dirs
+                                       if s != d and s.startswith(d + os.sep)]
+        if args.execute_entry_points:
+            names, per, base_missing, dots = auto_trace_scripts(
+                python_bin, d, args.trace_timeout, iso)
+            per_script.update(per)
+            baseline_missing |= base_missing
+            root = os.path.abspath(args.root) if args.root else None
+            for fn in sorted(per):
+                full = os.path.join(os.path.abspath(d), fn)
+                entry_points.append(os.path.relpath(full, root) if root else full)
+            dead = sorted(fn for fn, n in per.items() if n == 0)
+            if dead:
+                print("# trace warn: these entry points imported nothing (did not start): %s"
+                      % " ".join(dead), file=sys.stderr)
+        else:
+            names, dots, seeds, base_missing = imports_only_closure(
+                python_bin, d, args.trace_timeout, iso, scan_exclude)
+            import_seeds |= seeds
+            baseline_missing |= base_missing
+            print("# imports-only: %d import statement(s) across the scripts, %d module(s) "
+                  "loaded (no entry point was executed)" % (len(seeds), len(names)),
                   file=sys.stderr)
+        keep_trace |= names
+        dotted |= dots
+
+    # Installed packages: the same rule as the app's own scripts. Every import named
+    # anywhere in their source is a dependency, because which FILES of a distribution
+    # load is as much a branch decision as which imports inside a file fire - and the
+    # trace can only tell us about the files it happened to load.
 
     pkg_scope = None
     if args.packages and os.path.isdir(args.packages) and args.packages_surface:
@@ -1949,8 +2052,8 @@ def main(argv):
         # stdlib, yet its 42 installed distributions are all launched out-of-process from
         # shell. Seeding from imports alone found zero roots and scoped the scan to nothing.
         app_names = set()
-        for d in args.auto_trace_scripts:
-            app_names |= {s.split(".")[0] for s in all_imports_of_dir(d)}
+        for d in script_dirs:
+            app_names |= {s.split(".")[0] for s in all_imports_of_dir(d, scan_exclude)}
         app_names |= {c.split()[-1].split(".")[0] for c in args.trace if " -m " in c}
         app_names |= {m.split(".")[0] for m in (scan or {}).get("dash_m", ())}
         app_names |= set((scan or {}).get("mentions", {}))
@@ -2008,6 +2111,61 @@ def main(argv):
         keep_trace |= names
         dotted |= dots
 
+    extra = {n.strip() for n in args.keep.split(",") if n.strip()}
+    for kf in args.keep_file:
+        try:
+            with open(kf, encoding="utf-8") as f:
+                extra |= {ln.split("#")[0].strip() for ln in f if ln.split("#")[0].strip()}
+        except OSError as e:
+            raise SystemExit("--keep-file %s: %s" % (kf, e))
+    # Dotted module paths that live in config data rather than code - a logging config's
+    # `"()": "pkg.mod.Class"`, a plugin registry, a job definition. Reverse lookup against
+    # names this distribution provides, so it can only ever protect.
+    if args.scan_app_code:
+        dfn = data_file_names(args.scan_app_code, set(all_items),
+                              exclude=[args.packages, python_dir])
+        if dfn:
+            extra |= set(dfn)
+            print("# data-file module names: %s"
+                  % " ".join("%s(%s)" % (n, ",".join(sorted(f)[:2]))
+                             for n, f in sorted(dfn.items())), file=sys.stderr)
+
+    # A force-keep is a NAME, and a name without its dependencies is a module that still
+    # cannot be imported. Measured: `--keep compileall` kept compileall and removed
+    # filecmp, which compileall imports at module level - the keep was honored and the
+    # module raised anyway. So forced names are IMPORTED like any other seed. Their
+    # closure joins the keep set, the conditional-import fixpoint below sees them, and
+    # they enter import_seeds so verification re-checks them after the deletions instead
+    # of taking the keep on trust.
+    #
+    # data_file_names() feeds this set too, and it matches by reverse lookup, so a data
+    # file naming `calendar` for reasons of its own (one app's icon map does) forces a
+    # module nothing imports. That is the intended direction - the lookup can only ever
+    # protect - but note the consequence: such a name is now recorded in import_seeds, so
+    # verification will refuse a later plan that drops it. Move it out of the data files,
+    # not out of here, if it ever costs something worth reclaiming.
+    forced = {n for n in extra if n not in keep_trace}
+    if forced:
+        fnames, fdots, fbase = probe_seeds(python_bin, forced, args.trace_timeout, iso,
+                                           "force-keep", "_keepimports.py")
+        print("# force-keep: %d name(s) forced, %d module(s) kept with them%s"
+              % (len(forced), len(fnames - keep_trace),
+                 "; %s did not import" % " ".join(sorted(fbase)) if fbase else ""),
+              file=sys.stderr)
+        keep_trace |= fnames
+        dotted |= fdots
+        baseline_missing |= fbase
+        # Seed only what THIS distribution provides. Verification exists to prove the
+        # plan did not delete something needed, and it can only delete from here; a
+        # forced name that lives elsewhere is out of its scope. The distinction is not
+        # theoretical - plan-time traces put the app's scripts dir on PYTHONPATH and
+        # verification does not, so `--keep-file` naming a handler-local module (the
+        # documented remedy for a closure blind spot) imported at plan time, failed at
+        # verify time, and made apply fail permanently while reporting the failure as
+        # "not removed by this plan". Protection is unaffected: fnames and extra are
+        # still kept, only the verification seed is withheld.
+        import_seeds |= {n for n in forced if n.split(".")[0] in all_items}
+
     # Conditional imports inside the modules that loaded are dependencies too. Whether
     # they fire is a branch decision, and this tool does not decide branches.
     # Rewriting the modules IN PLACE to hoist these was built, measured and removed. Two
@@ -2038,24 +2196,6 @@ def main(argv):
         direct |= direct_imports(d)
     for f in args.runtime_log:
         keep_log |= load_log(f)
-    extra = {n.strip() for n in args.keep.split(",") if n.strip()}
-    for kf in args.keep_file:
-        try:
-            with open(kf, encoding="utf-8") as f:
-                extra |= {ln.split("#")[0].strip() for ln in f if ln.split("#")[0].strip()}
-        except OSError as e:
-            raise SystemExit("--keep-file %s: %s" % (kf, e))
-    # Dotted module paths that live in config data rather than code - a logging config's
-    # `"()": "pkg.mod.Class"`, a plugin registry, a job definition. Reverse lookup against
-    # names this distribution provides, so it can only ever protect.
-    if args.scan_app_code:
-        dfn = data_file_names(args.scan_app_code, set(all_items),
-                              exclude=[args.packages, python_dir])
-        if dfn:
-            extra |= set(dfn)
-            print("# data-file module names: %s"
-                  % " ".join("%s(%s)" % (n, ",".join(sorted(f)[:2]))
-                             for n, f in sorted(dfn.items())), file=sys.stderr)
     computed = computed_name_imports(python_bin, all_items)
     keep = keep_trace | keep_log | extra | computed | set(sys.builtin_module_names)
     # Coverage cross-check: source names these top-level modules but the trace never
@@ -2073,7 +2213,7 @@ def main(argv):
         print("\n".join(sorted(keep)))
         return 0
     if args.emit == "plan":
-        if not args.trace and not args.runtime_log and not args.auto_trace_scripts:
+        if not args.trace and not args.runtime_log and not script_dirs:
             print("# plan warn: no --trace/--auto-trace-scripts/--runtime-log given; the "
                   "closure is only builtins, so this plan would remove almost everything. "
                   "Provide a real workload.", file=sys.stderr)
