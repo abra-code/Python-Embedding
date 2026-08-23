@@ -22,6 +22,77 @@ Additional scripts:
 
 These three are **app-agnostic**: you tell them where the interpreter, the entry-point scripts and the third-party deps live (`--python`, `--auto-trace-scripts`, `--packages`, `--root`). They assume no directory layout of their own, so the same tooling thins a Python embedded in any host.
 
+  - `replay_bootstrap.sh`: Locates or installs the `replay` build engine used by `build-embedded-python.sh --use-replay` (see below). Standalone: it prints the path to a usable binary on stdout and can be run on its own.
+
+## Cached, parallel builds with replay (optional)
+
+`./build-embedded-python.sh` normally runs its phases as a hardcoded sequence: download Python, download OpenSSL, build OpenSSL, download xz, build xz, configure, build, post-process, verify. Every phase waits for the one before it even when the two have nothing to do with each other, and a re-run redoes all of it from scratch.
+
+`--use-replay` builds the same distribution through [replay](https://github.com/abra-code/replay) instead. The phases are emitted as a **playlist**: a JSON list of actions, each declaring the files it reads and the files it writes. replay derives the execution graph from those declarations rather than from the order they appear in, so it decides what can overlap, and since 2.2 it can skip any action whose declared world is unchanged since the last run.
+
+```bash
+./build-embedded-python.sh --use-replay --lzma-version=auto
+```
+
+Two things fall out of this that the sequential path cannot do:
+
+- **Independent work overlaps.** The three source downloads, the OpenSSL build and the xz build have no dependency on one another, so they run concurrently. Only the steps that genuinely feed each other are serialized.
+- **A second build resumes instead of restarting.** Change nothing and re-run: every step is skipped, in under a second. Bump only `--openssl-version` and OpenSSL is refetched and rebuilt and Python is reconfigured and rebuilt, while the Python download and unpack, all three xz steps and the lzma module setup are left untouched. The expensive PGO/LTO CPython build re-runs only when something it actually depends on moved.
+
+Ask what a build *would* do without doing it:
+
+```bash
+./build-embedded-python.sh --use-replay --replay-dry-run    # per-step HIT/MISS
+```
+
+### Options
+
+| Option | Effect |
+| --- | --- |
+| `--use-replay` | Build through the generated playlist instead of the fixed sequence |
+| `--replay-dry-run` | Print the plan and the per-step cache HIT/MISS report without building (replay is still bootstrapped and the playlist still written) |
+| `--replay-no-cache` | Use replay for scheduling only, with no incremental skipping |
+| `--replay-cache-refresh` | Re-execute every step and rebuild the cache manifest |
+| `--replay-serial` | One step at a time, in playlist order (readable logs) |
+| `--replay-verbose` | Show each step and its cache decision as it is scheduled |
+| `--replay-jobs=N` | Cap concurrently running steps (default: unbound) |
+| `--replay-bootstrap=METHOD` | How to obtain replay: `auto`, `pkg`, `source`, `path` |
+
+Concurrent steps write to the same terminal, so build logs interleave. Use `--replay-serial` when you need to read them.
+
+### Self-bootstrapping
+
+replay 2.2 or newer is required (2.2 is the release that introduced the execution cache). If it is missing, `replay_bootstrap.sh` installs one into `build/tools/bin/` before the build starts. Nothing is installed system-wide and no administrator authorization is requested:
+
+1. An existing `replay` on `PATH`, or one bootstrapped by an earlier run, is used if it is new enough. `REPLAY_BIN` overrides the search.
+2. Otherwise the latest release `.pkg` is downloaded, checked with `pkgutil --check-signature`, and its **payload expanded in place** with `xar` and `cpio`. A `.pkg` is a xar archive, so the binary can be lifted out of it without running the installer - which is what would otherwise need an authorization prompt.
+3. If that fails, the tool is built from source with `swift build -c release` and the products are copied into `build/tools/bin/`.
+
+The upstream one-liner installer is deliberately not used: it installs into `~/.local/bin` and appends a `PATH` line to `~/.zshrc`, and a build script should not edit your shell configuration. If you prefer that route, run it yourself and the build will find the result on `PATH`:
+
+```bash
+source <(/usr/bin/curl -fsSL 'https://raw.githubusercontent.com/abra-code/replay/refs/heads/master/install.sh')
+```
+
+On trust: expanding the payload by hand skips the signature check the installer would have run, so the bootstrap performs it explicitly and refuses any package macOS does not consider signed by a trusted developer certificate and notarized. What that cannot establish is *which* release you got - the project publishes no checksum to pin against, and the bootstrap always takes whatever is latest. Use `--replay-bootstrap=source` to build from the git repository instead, or `--replay-bootstrap=path` to refuse to install anything and require a replay you placed yourself.
+
+### How the playlist is built
+
+Nothing about the build is reimplemented for replay. Each playlist step re-invokes this same script with an internal `--task=<phase>` flag, so both engines call the identical shell functions; the playlist only describes how those phases relate. Versions are resolved once, up front, and every step is handed the concrete `--version`/`--openssl-version`/`--lzma-version` it must use, so no step re-runs auto-detection and a version bump changes the identity of every action downstream of it.
+
+The generated playlist is written to `build/python-<version>-<arch>/build-playlist.json` and the cache manifest to `build/.replay-cache/`. Both are readable; the playlist is worth a look if you want to see the declared graph.
+
+A few consequences worth knowing:
+
+- **The build tree is kept, not consumed.** The sequential path *moves* the finished install into place and renames the build directory to `.last`. Under replay the install tree is *copied* (an APFS clone, so it is nearly free) and the build directory is left alone. Moving it would destroy the very outputs the expensive steps declared, and the next run would miss on all of them and rebuild everything - defeating the cache.
+- **Editing this script invalidates everything.** `build-embedded-python.sh` is declared as an input of every step, because replay identifies an action by its command line and not by the contents of the script it runs. Editing a build phase must not leave its stale product cached.
+- **A toolchain upgrade invalidates the compiled steps.** The real `clang` behind `/usr/bin/clang` (via `xcrun --find`) is declared as an input of the compile steps, since `/usr/bin/clang` is only a stub whose contents do not change when Xcode does.
+- **Verification always runs, and checks one extra thing.** The final step declares no outputs, which is how replay is told never to cache it, so the sanity tests execute on every invocation even when everything else was skipped. It also asserts that no binary in the finished distribution still has a load command - dependency, install name **or** `LC_RPATH` - pointing into `build/`. The sequential engine gets that check for free without meaning to, since it moves the tree out and renames the build directory, so a missed relocation simply fails to load. Here both trees stay in place, a missed relocation would still resolve on the build machine, and the breakage would surface only after the distribution was bundled.
+
+Related, and applying to **both** engines: `--with-openssl-rpath=auto` bakes the build's OpenSSL directory into `_ssl` and `_hashlib` as an `LC_RPATH`, and that entry used to survive into the shipped distribution - an absolute path from the machine that did the build. Nothing resolves through it, since every dependency is rewritten to `@executable_path`, so it was leakage rather than breakage, but post-processing now strips any rpath pointing into `build/`.
+
+If you restructure the playlist, run once with `--replay-cache-refresh` to rebuild the manifest.
+
 ## Closure-based thinning (recommended)
 
 `thin_python_distribution.sh` is a *blacklist*: you name what to remove. That is fragile - one lazily-imported module you forgot and the app ships broken; and it cannot see dependencies pulled in across a `subprocess` boundary (an app that shells out to a bundled console script looks like it imports almost nothing).
