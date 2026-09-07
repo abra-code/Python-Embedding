@@ -52,7 +52,7 @@ MODES (combine freely; all results are unioned into the KEEP set)
                        into --packages, and extension-less files with a python shebang -
                        CLI helpers that a handler or a shell script starts BY PATH, so no
                        `-m` and no import statement anywhere names them. Each such tool's
-                       DIRECTORY is then analysed exactly as --auto-trace-scripts would,
+                       DIRECTORY is then analyzed exactly as --auto-trace-scripts would,
                        which is what reads the package sitting beside it.
   --trace "CMD ARGS"   run CMD under the embedded interpreter with -X importtime and
                        record every module imported. Repeatable. CMD's first token is
@@ -1229,6 +1229,11 @@ print(json.dumps(sorted(n for n in found if n)))
                 "_PYTHON_SYSCONFIGDATA_NAME"):
         env.pop(var, None)
     env["PYTHONNOUSERSITE"] = "1"
+    # As Isolation.env() does. This probe runs the APP's interpreter over the app's
+    # own stdlib, so without it CPython caches the bytecode of everything the probe
+    # imports back into the distribution - after thin_with_plan.sh has just removed
+    # exactly that, on a plan that asked for it.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
         out = subprocess.run([python_bin, "-s", "-c", probe], capture_output=True,
                              text=True, timeout=60, env=env)
@@ -1352,7 +1357,7 @@ def reachable_dists(packages_dir, app_names):
     the walk in what app code actually names, then following only the declared dependency
     edges beneath those roots, is what makes "unreachable" mean something.
 
-    Returns (reachable_dists, roots, unreachable_dists). Aliases are honoured on both
+    Returns (reachable_dists, roots, unreachable_dists). Aliases are honored on both
     sides, since app code names an IMPORT name and Requires-Dist names a DISTRIBUTION.
     """
     provides, requires, _auth = dist_graph(packages_dir)
@@ -1523,7 +1528,11 @@ def packages_report(packages_dir, reached, mentions=None, unreachable=None):
 
     orphans = [e["name"] for e in entries if e["verdict"] == "orphan-candidate"]
     out = {
-        "dir": packages_dir,
+        # Absolute, always. A plan is applied later, from somewhere else, by a tool
+        # that backs this directory up and deletes out of it - "./deps" recorded
+        # verbatim would resolve against whatever directory that run happens to
+        # start in.
+        "dir": os.path.abspath(packages_dir) if packages_dir else packages_dir,
         "policy": "report-only",
         "note": ("`remove` is intentionally empty. An entry is only a candidate when it is "
                  "BOTH unimported by every traced entry point AND undeclared by every "
@@ -1889,7 +1898,11 @@ def main(argv):
             # a plainly present .so as "already removed", which reads as a completed
             # deletion that never happened. The dist-info goes too, so the next audit's
             # dependency graph is not fed by metadata for something no longer there.
-            existing = os.listdir(pkgdir) if os.path.isdir(pkgdir) else []
+            # pkgdir is None for an applet with no Packages directory at all: the
+            # plan then carries no "packages" key and nothing passes --packages.
+            # os.path.isdir(None) raises, which used to surface as a traceback the
+            # caller discarded along with the exit status.
+            existing = os.listdir(pkgdir) if pkgdir and os.path.isdir(pkgdir) else []
             out = []
             for n in names:
                 hits = []
@@ -1922,7 +1935,7 @@ def main(argv):
     iso = Isolation(root=args.root, packages=args.packages, scripts=scripts_dir,
                     sandbox_profile=args.sandbox_profile, scratch=args.scratch)
     def warn_unsandboxed():
-        print("# isolation warn: analysing scripts runs module-level code of everything "
+        print("# isolation warn: analyzing scripts runs module-level code of everything "
               "they import%s; pass --sandbox-profile so a misbehaving module cannot write "
               "or reach the network."
               % (" AND executes each entry point" if args.execute_entry_points else ""),
@@ -1952,7 +1965,7 @@ def main(argv):
     # Entry points into Packages that only a shell script or a generated config names.
     # Discovered, not declared: this is what lets an app whose real workload is
     # `python3 -m some_pkg.cli` need no --trace at all. The same sweep finds the app's
-    # shebang tools, so it has to run BEFORE the scripts are analysed rather than after.
+    # shebang tools, so it has to run BEFORE the scripts are analyzed rather than after.
     discovered = []
     scan = None
     if args.scan_app_code:
@@ -2066,7 +2079,7 @@ def main(argv):
         # must still survive. Scoping the scan would have removed exactly that - and the one
         # distribution it excluded on both MCP apps was `cryptography`, already established
         # as reachable through a conditional import that Requires-Dist records only as an
-        # extra. Judgement and protection answer different questions.
+        # extra. Judgment and protection answer different questions.
         surface, nfiles, nprov = package_import_surface(args.packages)
         eps = entry_point_modules(args.packages)
         extra = (surface | eps) - import_seeds

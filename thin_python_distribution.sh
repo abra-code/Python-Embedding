@@ -41,7 +41,7 @@ Common optional removals (verify your app/scripts do not need them):
   multiprocessing - Parallel execution (~408KB multiprocessing/ dir)
   unittest        - Testing framework (~284KB unittest/ dir)
   xmlrpc          - XML-RPC client/server (deprecated; ~88KB xmlrpc/ dir)
-  pip             - Package manager (~20-30MB with deps) — also removes universalPip/uPip if installed
+  pip             - Package manager (~20-30MB with deps) - also removes universalPip/uPip if installed
   setuptools      - Packaging tools
   certifi         - CA certificate bundle (breaks HTTPS verification if removed)
   include         - "include" headers for building some modules (not needed in sealed Python package)
@@ -108,6 +108,7 @@ thin_to_single_arch() {
     local executable_files=$(/usr/bin/find "$PYTHON_DIR" -type f \( -name '*.dylib' -o -name '*.so' -o -perm -u+x \))
 
     local thinned=0
+    local failed=0
     local file
     
     # Process each candidate file
@@ -124,19 +125,39 @@ thin_to_single_arch() {
 
             /usr/bin/lipo -thin "$arch" "$file" -output "$tmp" 2>/dev/null
             local lipo_result=$?
-            
+
             if [ $lipo_result -eq 0 ]; then
+                # Checked, and counted only when it took: an unchecked mv left the
+                # binary universal, left the .tmp beside it, and printed nothing, so
+                # a caller saw a clean run over a file it had not thinned.
                 /bin/mv "$tmp" "$file"
-                thinned=$((thinned + 1))
+                local mv_result=$?
+                if [ $mv_result -eq 0 ]; then
+                    thinned=$((thinned + 1))
+                else
+                    echo "    Warning: lipo -thin $arch could not replace $file (mv exit $mv_result)"
+                    /bin/rm -f "$tmp"
+                    failed=$((failed + 1))
+                fi
             else
                 echo "    Warning: lipo -thin $arch failed on $file (arch possibly missing)"
                 /bin/rm -f "$tmp"
+                failed=$((failed + 1))
             fi
         fi
     done <<< "$executable_files"
     
     echo "  Thinned $thinned files to $arch."
     echo
+
+    # A slice that could not be made is a FAILURE, not a note in passing. The caller
+    # deletes the backup and reports success on this status, and a plan recording
+    # arch: <x> would then describe a distribution that still carries both.
+    if [ "$failed" -gt 0 ]; then
+        echo "  $failed file(s) could not be thinned to $arch."
+        return 1
+    fi
+    return 0
 }
 
 remove_component() {
@@ -484,19 +505,38 @@ main() {
     echo "Current size of $PYTHON_DIR: $initial_size"
     echo
         
-    # Perform component removal if any components specified
+    # Perform component removal if any components specified.
+    #
+    # Its status is folded into the return below, but be aware of what that is worth
+    # today: remove_component reports a failed removal by echo and returns bare, and
+    # thin_components ends on check_and_remove_libcrypto, so the only non-zero this
+    # can currently carry is a hard error before any component is touched. A caller
+    # that needs "the pyc really came out" cannot get it from this status yet.
+    local comp_result=0
     if [ ${#COMPONENTS[@]} -gt 0 ]; then
         thin_components "${COMPONENTS[@]}"
+        comp_result=$?
     fi
 
     # Perform architecture thinning if requested
+    local arch_result=0
     if [[ -n "$ARCH" ]]; then
         thin_to_single_arch "$ARCH"
+        arch_result=$?
     fi
 
     local final_size=$(calc_size "$PYTHON_DIR")
     echo "Final size of $PYTHON_DIR: $final_size"
     echo
+
+    # Reported after the sizes, so the transcript still shows what the run did, but
+    # reported: a caller that deletes its backup on a zero exit would otherwise call
+    # a half-sliced distribution a success.
+    if [ "$arch_result" -ne 0 ] || [ "$comp_result" -ne 0 ]; then
+        return 1
+    fi
+    return 0
 }
 
 main "$@"
+exit $?
