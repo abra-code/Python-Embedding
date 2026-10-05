@@ -7,6 +7,8 @@ Main script: `build-embedded-python.sh`
   - you may specify --arch=arm64 for single-architecture binary for Apple Silicon Macs only
   - the latest version is automatically detected and downloaded but you may specify a different Python version with --version=3.x.x
   - cross-compilation of single architecture is not supported by Python build system, i.e. you cannot build x86_64 on arm64 Mac but you can build universal binary with both architectures
+  - pass `--lzma-version=auto` to include the `lzma` module (off by default); liblzma is linked statically into it
+  - the text files of the finished distribution do not name the machine that built it: the build directory recorded by Python's generated configuration files (`_sysconfigdata_*.py`, `_sysconfig_vars_*.json`, `build-details.json`) is replaced with the placeholder `/embedded-python-build`, and pip's `RECORD` entries for bytecode written outside the distribution are dropped. Install paths are unaffected, since Python derives them from where the interpreter runs. `libpython` and `libcrypto` still carry the path as compiled-in strings
   - tests scripts are run after a successful build and can also be executed separately
   
 Additional scripts:  

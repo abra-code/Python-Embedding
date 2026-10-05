@@ -1103,6 +1103,132 @@ deployment_cleanup() {
     /usr/bin/find lib/python${MAJOR_MINOR} -name "*.py[co]" -exec /bin/rm -v {} \;
 }
 
+# Take the build machine's paths out of the text files of the distribution.
+#
+# Python records its configure-time world in three generated files
+# (_sysconfigdata_*.py, _sysconfig_vars_*.json, build-details.json), and pip
+# lists the bytecode it compiled in each package's RECORD - under
+# PYTHONPYCACHEPREFIX, so those entries name files that are not in the
+# distribution at all. Every one of them spells out the absolute path of the
+# build directory, user name included, and ships it to every machine.
+#
+# Nothing resolves through these paths: the build directory is gone or renamed
+# by the time the distribution is used, and sysconfig derives prefix and the
+# install paths from the running interpreter. So they are rewritten to a fixed
+# placeholder rather than made "correct", which no fixed text could be for a
+# tree that is copied into an app bundle.
+#
+# This must run after everything that reads sysconfig to compile or install
+# (the pip installs build regex from source), hence last in post-processing.
+#
+# Not covered: libpython and libcrypto carry the same path as compiled-in
+# strings (the configured prefix, OpenSSL's OPENSSLDIR). Rewriting those means
+# configuring both builds with a different prefix, not editing text.
+BUILD_PATH_PLACEHOLDER="/embedded-python-build"
+
+scrub_build_paths() {
+    echo
+    echo "==== Removing build machine paths from text files ===="
+    echo
+
+    # Every grep and sed below runs with LC_ALL=C, so the path is compared byte
+    # for byte. In a UTF-8 locale grep does not match on a line holding a byte
+    # that is not valid UTF-8 (the final check would pass over it), and sed
+    # refuses the whole file with "illegal byte sequence".
+    local record
+    local kept
+    local status
+    local records
+    records=$(/usr/bin/find "$INSTALL_DIR" -type f -name RECORD -path '*.dist-info/*')
+    while IFS= read -r record; do
+        [ -z "$record" ] && continue
+        LC_ALL=C /usr/bin/grep -qF -- "${BUILD_FLAVOR_DIR}/" "$record"
+        status=$?
+        [ "$status" -ne 0 ] && continue
+
+        # grep -v exits 1 when it keeps no line at all, which is not a failure.
+        kept="${record}.scrubbed"
+        LC_ALL=C /usr/bin/grep -vF -- "${BUILD_FLAVOR_DIR}/" "$record" > "$kept"
+        status=$?
+        if [ "$status" -gt 1 ]; then
+            /bin/rm -f "$kept"
+            fail "cannot filter $record"
+        fi
+        /bin/mv -f "$kept" "$record"
+        status=$?
+        if [ "$status" -ne 0 ]; then
+            /bin/rm -f "$kept"
+            fail "cannot replace $record"
+        fi
+        echo "  Dropped out-of-tree entries from ${record#"$INSTALL_DIR"/}"
+    done <<< "$records"
+
+    # The path is data here, not a pattern: escape what sed would interpret.
+    local pattern
+    pattern=$(printf '%s' "$BUILD_FLAVOR_DIR" | LC_ALL=C /usr/bin/sed 's/[][\.*^$|]/\\&/g')
+
+    local text_file
+    local text_files
+    text_files=$(LC_ALL=C /usr/bin/grep -rIlF -- "$BUILD_FLAVOR_DIR" "$INSTALL_DIR")
+    while IFS= read -r text_file; do
+        [ -z "$text_file" ] && continue
+        [ -L "$text_file" ] && continue
+        LC_ALL=C /usr/bin/sed -i '' "s|${pattern}|${BUILD_PATH_PLACEHOLDER}|g" "$text_file"
+        status=$?
+        [ "$status" -ne 0 ] && fail "cannot rewrite $text_file"
+        echo "  Rewrote ${text_file#"$INSTALL_DIR"/}"
+    done <<< "$text_files"
+
+    # sysconfig also snapshots the builder's per-user site directory
+    # ("userbase": "/Users/<name>/.local"). It is recomputed from the running
+    # user's home on every use, so the recorded one is only a name to leak.
+    local home_pattern
+    local sysconfig_file
+    if [ -n "${HOME:-}" ] && [ "$HOME" != "/" ]; then
+        home_pattern=$(printf '%s' "$HOME" | LC_ALL=C /usr/bin/sed 's/[][\.*^$|]/\\&/g')
+        for sysconfig_file in "$INSTALL_DIR/lib/python${MAJOR_MINOR}"/_sysconfig*; do
+            [ -f "$sysconfig_file" ] || continue
+            LC_ALL=C /usr/bin/grep -qF -- "$HOME/" "$sysconfig_file"
+            status=$?
+            [ "$status" -ne 0 ] && continue
+            LC_ALL=C /usr/bin/sed -i '' "s|${home_pattern}/|~/|g" "$sysconfig_file"
+            status=$?
+            [ "$status" -ne 0 ] && fail "cannot rewrite $sysconfig_file"
+            echo "  Rewrote the home directory in ${sysconfig_file#"$INSTALL_DIR"/}"
+        done
+    fi
+
+    local leftover
+    leftover=$(LC_ALL=C /usr/bin/grep -rIlF -- "$BUILD_FLAVOR_DIR" "$INSTALL_DIR")
+    if [ -n "$leftover" ]; then
+        echo "$leftover" | LC_ALL=C /usr/bin/sed 's|^|    |'
+        fail "text files still name the build directory $BUILD_FLAVOR_DIR"
+    fi
+
+    # -I above skipped the binaries; say what is left in them instead of
+    # letting "OK" read as "the path is gone".
+    local binaries
+    binaries=$(LC_ALL=C /usr/bin/grep -rlF -- "$BUILD_FLAVOR_DIR" "$INSTALL_DIR")
+    echo "  ${GREEN}OK: no text file names $BUILD_FLAVOR_DIR${RESET}"
+    if [ -n "$binaries" ]; then
+        echo "  Still present as compiled-in strings (not rewritten):"
+        while IFS= read -r text_file; do
+            echo "    ${text_file#"$INSTALL_DIR"/}"
+        done <<< "$binaries"
+    fi
+
+    # Anything else naming the builder's home is reported, not fatal: a module
+    # installed later may legitimately record where it came from.
+    local home_refs
+    if [ -n "${HOME:-}" ] && [ "$HOME" != "/" ]; then
+        home_refs=$(LC_ALL=C /usr/bin/grep -rIlF -- "$HOME/" "$INSTALL_DIR")
+        if [ -n "$home_refs" ]; then
+            echo "  ${RED}Warning: text files still name $HOME:${RESET}"
+            echo "$home_refs" | LC_ALL=C /usr/bin/sed 's|^|    |'
+        fi
+    fi
+}
+
 verify_universal_binaries() {
     local target_dir="$FINAL_DIR"
 
@@ -1367,6 +1493,7 @@ task_postprocess() {
     fix_helper_shebangs
     strip_debug_symbols
     deployment_cleanup
+    scrub_build_paths
     write_stamp postprocess
 }
 
@@ -1858,6 +1985,7 @@ main() {
     fix_helper_shebangs
     strip_debug_symbols
     deployment_cleanup
+    scrub_build_paths
     finalize
     rename_build_artifacts
     verify_universal_binaries

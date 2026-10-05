@@ -25,6 +25,7 @@ RESET = "\033[0m"
 failed_count = 0
 
 def run_test(name, func):
+    global failed_count
     print(f"=== {name} ===")
     try:
         func()
