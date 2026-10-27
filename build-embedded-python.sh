@@ -1074,7 +1074,7 @@ deployment_cleanup() {
     /bin/rm -rfv share/man
 
     echo "  Removing config directory (static lib + build files)"
-    /bin/rm -rfv lib/python${MAJOR_MINOR}/config-3.14-darwin
+    /bin/rm -rfv "lib/python${MAJOR_MINOR}/config-${MAJOR_MINOR}-darwin"
 
     echo "  Removing *-intel64 binaries (universal build)"
     /bin/rm -fv bin/*-intel64
